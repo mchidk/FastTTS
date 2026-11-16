@@ -190,9 +190,15 @@ def inject_text(
 
     if method == "clipboard":
         previous = clipboard.get_text()
-        clipboard.set_text(text)
+        for _ in range(3):
+            clipboard.set_text(text)
+            if clipboard.get_text() == text:
+                break
+            time.sleep(0.03)
+        else:
+            raise OSError("Could not put the transcript on the clipboard")
         try:
-            time.sleep(0.05)
+            time.sleep(0.08)
             send_ctrl_v()
             time.sleep(paste_delay_ms / 1000.0)
         finally:

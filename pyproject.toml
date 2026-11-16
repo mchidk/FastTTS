@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fasttts"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast local English dictation for Windows: hold Caps Lock, speak, and the text is typed"
 readme = "README.md"
 license = "MIT"

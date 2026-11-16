@@ -322,34 +322,38 @@ class DictateApp:
 
     def _insert(self, text: str) -> None:
         try:
-            inject_text(
-                text,
-                method=self.config.inject,
-                delay_ms=self.config.char_delay_ms,
-                append_space=self.config.append_space,
-                paste_delay_ms=self.config.paste_delay_ms,
-            )
+            self._inject(text, self.config.inject)
         except OSError as exc:
-            if self.config.inject != "sendinput":
+            if self.config.inject == "clipboard":
+                fallback = "sendinput"
+                delay = max(10, self.config.char_delay_ms)
+            elif self.config.inject == "sendinput":
+                fallback = "clipboard"
+                delay = None
+            else:
                 self._fail(f"Could not insert the transcript: {exc}", "INPUT BLOCKED")
                 return
-            log.warning("SendInput was blocked (%s); trying the clipboard", exc)
+            log.warning("%s insertion failed (%s); trying %s", self.config.inject, exc, fallback)
             try:
-                inject_text(
-                    text,
-                    method="clipboard",
-                    append_space=self.config.append_space,
-                    paste_delay_ms=self.config.paste_delay_ms,
-                )
-            except Exception as fallback:
-                self._fail(f"Could not insert the transcript: {fallback}", "INPUT BLOCKED")
+                self._inject(text, fallback, delay)
+            except Exception as fallback_error:
+                self._fail(f"Could not insert the transcript: {fallback_error}", "INPUT BLOCKED")
                 return
-            self._set_status(f"Inserted {len(text)} characters (clipboard)")
+            self._set_status(f"Inserted {len(text)} characters ({fallback})")
             return
         except Exception as exc:
             self._fail(f"Could not insert the transcript: {exc}", "INPUT ERROR")
             return
         self._set_status(f"Inserted {len(text)} characters")
+
+    def _inject(self, text: str, method: str, delay_ms: int | None = None) -> None:
+        inject_text(
+            text,
+            method=method,
+            delay_ms=self.config.char_delay_ms if delay_ms is None else delay_ms,
+            append_space=self.config.append_space,
+            paste_delay_ms=self.config.paste_delay_ms,
+        )
 
     def _cancel_recording(self) -> None:
         self.recorder.cancel()

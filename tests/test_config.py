@@ -12,7 +12,9 @@ def test_defaults_are_english_and_sane() -> None:
     config = Config()
     config.validate()
     assert config.model == ""  # "" means the bundled model
-    assert config.inject == "sendinput"
+    assert config.inject == "clipboard"
+    assert config.char_delay_ms == 10
+    assert config.paste_delay_ms == 400
     assert config.cleanup is True
     assert config.hot_mic is True
     assert config.hud is True

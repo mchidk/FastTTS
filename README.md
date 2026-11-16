@@ -16,7 +16,7 @@ No window to manage. No CLI. No cloud. No text-to-speech. Just push-to-talk.
 - The microphone stream stays open with a 250 ms pre-roll, so the first word
   is not lost and the first take starts instantly.
 - Takes are transcribed off the keyboard thread; you can start the next take
-  while the previous one is still being typed.
+  while the previous one is still being pasted.
 
 ## The oscilloscope HUD
 
@@ -69,7 +69,7 @@ archive FastTTS.
 3. Release Caps Lock.
 
 The tray icon turns red while recording and amber while transcribing. The
-transcript is typed at the caret and a space is appended. Hold-to-talk always
+transcript is pasted at the caret and a space is appended. Hold-to-talk always
 wins: Caps Lock never toggles the keyboard state.
 
 - Taps shorter than 250 ms are discarded silently.
@@ -110,14 +110,20 @@ sounds = true               # short stop/error cues
 hud = true                  # oscilloscope above the taskbar
 
 # Text insertion
-inject = "sendinput"        # sendinput, clipboard or none
-char_delay_ms = 1
-paste_delay_ms = 180
+inject = "clipboard"        # clipboard (reliable) or sendinput
+char_delay_ms = 10          # only used by sendinput
+paste_delay_ms = 400        # wait for the target to process Ctrl+V
 append_space = true
 ```
 
 Environment variables override individual keys, for example
 `FASTTTS_MIC_DEVICE=2` or `FASTTTS_CLEANUP=false`.
+
+The default uses an atomic clipboard paste (`Ctrl+V`), which avoids the
+key-up loss that per-character synthetic typing can cause in the new Windows 11
+Notepad. The previous clipboard text is restored after the paste. Set
+`inject = "sendinput"` for apps that ignore paste; FastTTS then types at 10 ms
+per character and falls back to the clipboard if input is blocked.
 
 `inject = "none"` recognises speech and writes it to the log without typing;
 useful for testing a microphone without touching the focused app.
@@ -135,9 +141,10 @@ behaviour. See [NOTICE](NOTICE) for third-party components.
 
 ## Troubleshooting
 
-- **Nothing is typed.** Some elevated (administrator) windows reject synthetic
-  input. FastTTS falls back to the clipboard paste path; if that is also
-  blocked, run FastTTS at the same elevation as the target app.
+- **Nothing is inserted.** Some elevated (administrator) windows reject synthetic
+  input. FastTTS tries the other insertion method automatically. If both are
+  blocked, run FastTTS at the same elevation as the target app. If an app
+  ignores `Ctrl+V`, set `inject = "sendinput"`.
 - **"Model unavailable".** Check that `models/faster-whisper-small.en/model.bin`
   exists and is about 484 MB. FastTTS loads it from the local folder and never
   downloads it.

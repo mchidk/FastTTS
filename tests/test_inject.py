@@ -69,6 +69,17 @@ def test_clipboard_mode_restores_text(monkeypatch) -> None:
     assert clipboard["value"] == "old"
 
 
+def test_clipboard_must_actually_update(monkeypatch) -> None:
+    monkeypatch.setattr(inject.clipboard, "get_text", lambda: "stale")
+    monkeypatch.setattr(inject.clipboard, "set_text", lambda value: None)
+    monkeypatch.setattr(inject.time, "sleep", lambda seconds: None)
+    called: list[bool] = []
+    monkeypatch.setattr(inject, "send_ctrl_v", lambda: called.append(True))
+    with pytest.raises(OSError, match="clipboard"):
+        inject.inject_text("new", method="clipboard")
+    assert called == []
+
+
 def test_unknown_method_is_an_error() -> None:
     with pytest.raises(ValueError):
         inject.inject_text("hello", method="magic")

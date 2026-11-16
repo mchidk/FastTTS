@@ -88,9 +88,9 @@ class Config:
     hud: bool = True
 
     # Text insertion.
-    inject: str = "sendinput"
-    char_delay_ms: int = 1
-    paste_delay_ms: int = 180
+    inject: str = "clipboard"
+    char_delay_ms: int = 10
+    paste_delay_ms: int = 400
     append_space: bool = True
 
     path: Path | None = field(default=None, compare=False, repr=False)

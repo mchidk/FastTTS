@@ -180,7 +180,7 @@ def test_start_requires_a_minimum_hold(monkeypatch) -> None:
 
 
 def test_transcription_inserts_text(monkeypatch) -> None:
-    app = make_app(monkeypatch)
+    app = make_app(monkeypatch, inject="sendinput")
     app.transcriber = FakeTranscriber("hello there")
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -205,7 +205,7 @@ def test_empty_transcript_reports_no_speech(monkeypatch) -> None:
 
 
 def test_sendinput_blocked_falls_back_to_clipboard(monkeypatch) -> None:
-    app = make_app(monkeypatch)
+    app = make_app(monkeypatch, inject="sendinput")
     methods: list[str] = []
 
     def fake_inject(text, **kwargs):
@@ -217,6 +217,24 @@ def test_sendinput_blocked_falls_back_to_clipboard(monkeypatch) -> None:
     app._insert("hello")
     assert methods == ["sendinput", "clipboard"]
     assert "clipboard" in app._status
+
+
+def test_clipboard_blocked_falls_back_to_sendinput(monkeypatch) -> None:
+    app = make_app(monkeypatch, inject="clipboard")
+    methods: list[str] = []
+    delays: list[int] = []
+
+    def fake_inject(text, **kwargs):
+        methods.append(kwargs["method"])
+        delays.append(kwargs["delay_ms"])
+        if kwargs["method"] == "clipboard":
+            raise OSError("clipboard busy")
+
+    monkeypatch.setattr(app_module, "inject_text", fake_inject)
+    app._insert("hello")
+    assert methods == ["clipboard", "sendinput"]
+    assert delays[-1] >= 10
+    assert "sendinput" in app._status
 
 
 def test_pause_uses_caps_lock_normally(monkeypatch) -> None:

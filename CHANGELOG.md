@@ -4,6 +4,21 @@ All notable changes to FastTTS are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions use
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.1 - 2026-11-16
+
+### Fixed
+
+- Corrupted or repeated characters in Windows 11 Notepad. Fast per-character
+  SendInput at 1 ms could lose key-up events, producing text like
+  "wwwwwwww" and "iiiiiiii" with gaps. Clipboard paste is now the default:
+  it is atomic, verifies the clipboard before sending Ctrl+V, waits 400 ms,
+  and restores the previous clipboard only if it is still ours.
+- SendInput remains available with a safer 10 ms per-character delay, and
+  automatically falls back to the clipboard if synthetic input is blocked.
+- Clipboard fallback now reports an error instead of pasting stale clipboard
+  contents when the clipboard cannot be updated.
+- 76 offline tests.
+
 ## 0.1.0 - 2026-11-16
 
 First release: a lean, English-only dictation app for Windows.
