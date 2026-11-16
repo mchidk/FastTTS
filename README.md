@@ -106,7 +106,7 @@ mic_device = ""             # "" = Windows default; or an index or name
 min_hold_ms = 250           # shorter taps are discarded
 max_record_seconds = 120
 hot_mic = true              # keep the microphone open
-sounds = true               # short stop/error cues
+sounds = false              # optional stop/error cues
 hud = true                  # oscilloscope above the taskbar
 
 # Text insertion

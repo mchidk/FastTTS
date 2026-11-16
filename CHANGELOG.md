@@ -4,6 +4,14 @@ All notable changes to FastTTS are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions use
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.2 - 2026-11-16
+
+### Changed
+
+- FastTTS is silent by default. The beep heard after releasing Caps Lock was
+  the transcript-captured cue, not a Caps Lock toggle sound. Set
+  `sounds = true` to bring back the stop/error cues.
+
 ## 0.1.1 - 2026-11-16
 
 ### Fixed
@@ -38,7 +46,7 @@ First release: a lean, English-only dictation app for Windows.
 - On-screen oscilloscope HUD with live microphone bars while listening, a
   scanning pulse while transcribing, and short error messages.
 - README screenshots of the listening, transcribing and error HUD states.
-- Short stop/error cues, optional via `sounds = false`.
+- Short stop/error cues, off by default; set `sounds = true` to enable.
 - Single-instance guard and rotating file log.
 - Clipboard fallback when SendInput is blocked, plus a `clipboard` mode and an
   `inject = "none"` test mode.

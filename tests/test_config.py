@@ -18,6 +18,7 @@ def test_defaults_are_english_and_sane() -> None:
     assert config.cleanup is True
     assert config.hot_mic is True
     assert config.hud is True
+    assert config.sounds is False
     assert config.min_hold_ms == 250
 
 

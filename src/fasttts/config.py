@@ -84,7 +84,7 @@ class Config:
     min_hold_ms: int = 250
     max_record_seconds: float = 120.0
     hot_mic: bool = True
-    sounds: bool = True
+    sounds: bool = False
     hud: bool = True
 
     # Text insertion.
