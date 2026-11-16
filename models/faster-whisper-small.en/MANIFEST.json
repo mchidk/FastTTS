@@ -1,0 +1,12 @@
+{
+  "source": "Systran/faster-whisper-small.en",
+  "revision": "d1d751a5f8271d482d14ca55d9e2deeebbae577f",
+  "license": "MIT",
+  "language": "en",
+  "files": {
+    "config.json": 2657,
+    "model.bin": 483545366,
+    "tokenizer.json": 2128466,
+    "vocabulary.txt": 422309
+  }
+}

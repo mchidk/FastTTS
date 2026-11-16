@@ -1,0 +1,43 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Bundled model weights: large, so keep them local and track only the manifest.
+models/*
+!models/faster-whisper-small.en/
+models/faster-whisper-small.en/*
+!models/faster-whisper-small.en/MANIFEST.json
+*.gguf
+*.safetensors
+*.pt
+*.bin
+*.pid
+
+# Generated audio and logs
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.log
+
+# Local credentials and key material
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini

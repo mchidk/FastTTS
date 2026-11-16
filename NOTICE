@@ -1,0 +1,56 @@
+FastTTS
+Copyright (c) 2026 Michael Christensen
+Licensed under the MIT License (see LICENSE).
+
+FastTTS is an independent project and is not affiliated with OpenAI or SYSTRAN.
+
+Runtime components
+==================
+
+faster-whisper
+  Copyright SYSTRAN. Licensed under the MIT License.
+  https://github.com/SYSTRAN/faster-whisper
+
+Whisper small.en model (Systran/faster-whisper-small.en)
+  Derived from OpenAI Whisper. Whisper and the converted weights are released
+  under the MIT License. The model is bundled locally in
+  models/faster-whisper-small.en for this checkout.
+  https://huggingface.co/Systran/faster-whisper-small.en
+
+CTranslate2
+  Copyright OpenNMT. Licensed under the MIT License.
+  https://github.com/OpenNMT/CTranslate2
+
+PyAV / FFmpeg
+  PyAV is BSD-3-Clause; FFmpeg is LGPL-2.1-or-later by default.
+  https://github.com/PyAV-Org/PyAV
+
+onnxruntime
+  Copyright Microsoft. Licensed under the MIT License.
+  https://github.com/microsoft/onnxruntime
+
+Hugging Face Hub and tokenizers
+  Apache License 2.0.
+  https://github.com/huggingface/huggingface_hub
+  https://github.com/huggingface/tokenizers
+
+pystray
+  Licensed under the GNU Lesser General Public License v3.0.
+  https://github.com/moses-palmer/pystray
+
+Pillow
+  Licensed under the HPND License.
+  https://python-pillow.org
+
+numpy
+  BSD-3-Clause.
+  https://numpy.org
+
+sounddevice
+  MIT License; bundles PortAudio (MIT-like).
+  https://python-sounddevice.readthedocs.io
+
+No model weights or native binaries are committed to the FastTTS repository.
+The English Whisper model is bundled locally under models/faster-whisper-small.en;
+it is excluded from Git because of its size and remains subject to its own
+license.
