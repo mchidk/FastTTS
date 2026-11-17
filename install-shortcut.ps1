@@ -19,6 +19,7 @@ $shortcut = Join-Path $DesktopPath 'FastTTS.lnk'
 $shell = New-Object -ComObject WScript.Shell
 $link = $shell.CreateShortcut($shortcut)
 $link.TargetPath = $exe
+$link.Arguments = ''
 $link.WorkingDirectory = $root
 if (Test-Path $icon) { $link.IconLocation = "$icon,0" }
 $link.Description = 'FastTTS - hold Caps Lock to dictate'
