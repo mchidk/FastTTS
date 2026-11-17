@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2 - 2026-11-17
+
+### Fixed
+
+- A 2-second silent take no longer takes >5 seconds. whisper.cpp encodes a
+  fixed 30-second window for any non-zero audio and hallucinates words like
+  "you" on room noise, with a slow temperature-fallback chain. A cheap frame
+  energy gate now rejects silence/room noise before the model is called, so
+  "NO SPEECH" is instant.
+- Default model switched from `ggml-small.en.bin` (~488 MB) to
+  `ggml-base.en.bin` (~148 MB) for much faster real transcription. Set
+  `model = "<path to ggml-small.en.bin>"` in the config for maximum accuracy.
+- Segments whisper.cpp marks as non-speech are discarded.
+
 ## 0.2.1 - 2026-11-17
 
 ### Added

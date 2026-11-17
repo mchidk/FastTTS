@@ -9,7 +9,7 @@ use std::{env, fs, path::PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Empty means the bundled ggml model under models/whisper.cpp.
+    /// Empty means the bundled fast ggml-base.en model.
     pub model: String,
     /// 0 = let whisper.cpp choose.
     pub threads: usize,
@@ -166,7 +166,7 @@ impl Config {
         if !self.model.is_empty() {
             return PathBuf::from(&self.model);
         }
-        project_root().join("models/whisper.cpp/ggml-small.en.bin")
+        project_root().join("models/whisper.cpp/ggml-base.en.bin")
     }
 }
 
