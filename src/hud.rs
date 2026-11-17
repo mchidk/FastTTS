@@ -460,6 +460,19 @@ impl RenderCtx {
             return;
         }
 
+        // The PNG includes static bars for the README screenshots. Clear the
+        // strip so the live oscilloscope is the only thing drawn at runtime.
+        let panel = [27u8, 29u8, 37u8]; // #1B1D25
+        for y in BAR_TOP..BAR_BOTTOM.min(h) {
+            for x in 0..w {
+                let p = (y * w + x) * 4;
+                frame[p] = panel[0];
+                frame[p + 1] = panel[1];
+                frame[p + 2] = panel[2];
+                frame[p + 3] = 255;
+            }
+        }
+
         let heights = self.bar_heights(mode, now);
         let center = ((BAR_TOP + BAR_BOTTOM) / 2) as isize;
         let left_edge = (w / 20).max(8);
@@ -513,7 +526,7 @@ impl RenderCtx {
                 SourceConstantAlpha: 255,
                 AlphaFormat: 1, // AC_SRC_ALPHA
             };
-            let _ = UpdateLayeredWindow(
+            if let Err(err) = UpdateLayeredWindow(
                 self.hwnd,
                 Some(self.screen_dc),
                 Some(&destination),
@@ -523,7 +536,9 @@ impl RenderCtx {
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
-            );
+            ) {
+                tracing::warn!("UpdateLayeredWindow failed: {err:?}");
+            }
         }
     }
 }
@@ -619,4 +634,22 @@ fn hud_thread(
         let _ = DestroyWindow(ctx.hwnd);
     }
     ctx.cleanup_gdi();
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::{Hud, HudMode};
+    use std::{path::PathBuf, thread, time::Duration};
+
+    #[ignore]
+    #[test]
+    fn preview() {
+        let root = PathBuf::from(r"C:\repros\FastTTS");
+        let hud = Hud::new(&root).expect("hud");
+        hud.set_mode(HudMode::Recording, "");
+        for i in 0..240 {
+            hud.push_level(0.02 + 0.25 * (i as f32 * 0.18).abs().sin());
+            thread::sleep(Duration::from_millis(33));
+        }
+    }
 }
