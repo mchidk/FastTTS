@@ -16,6 +16,10 @@ runtime, no PyTorch, no Hugging Face client, no CLI, no TTS.
   with the first word and no device-open latency.
 - One Win32 message loop drives the tray, Caps Lock hook and HUD; transcription
   runs on its own worker thread and never blocks input.
+- **Streaming transcription:** while you hold Caps Lock, complete phrases are
+  transcribed as soon as you pause, with a 4-second maximum chunk. Partial
+  transcripts are kept in memory, so releasing Caps Lock only has to finish the
+  short tail — it feels nearly instant.
 
 ## The oscilloscope HUD
 
@@ -81,6 +85,9 @@ model = ""                 # "" = the bundled ggml-small.en.bin
 threads = 0                # 0 = choose automatically
 initial_prompt = ""
 cleanup = true
+chunk_seconds = 4.0        # longest audio chunk while holding
+silence_ms = 350           # flush a phrase after this much silence
+min_chunk_seconds = 0.8    # shortest chunk worth transcribing
 min_hold_ms = 250
 max_record_seconds = 120
 hot_mic = true

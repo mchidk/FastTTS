@@ -44,6 +44,29 @@ use windows::{
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_HOTKEY: u32 = WM_APP + 2;
 
+/// Drop leading/trailing quiet frames so chunk boundaries do not carry noise.
+fn trim_silence(samples: &[f32]) -> &[f32] {
+    const FRAME: usize = 160; // 10 ms at 16 kHz
+    const THRESHOLD: f32 = 0.006;
+    if samples.len() < FRAME * 2 {
+        return samples;
+    }
+    let rms = |part: &[f32]| (part.iter().map(|x| x * x).sum::<f32>() / part.len() as f32).sqrt();
+    let mut start = 0;
+    while start + FRAME <= samples.len() && rms(&samples[start..start + FRAME]) < THRESHOLD {
+        start += FRAME;
+    }
+    let mut end = samples.len();
+    while end >= start + FRAME * 2 && rms(&samples[end - FRAME..end]) < THRESHOLD {
+        end -= FRAME;
+    }
+    if end > start {
+        &samples[start..end]
+    } else {
+        samples
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     Loading,
@@ -56,7 +79,15 @@ enum State {
 
 enum WorkerEvent {
     Ready,
-    Transcript(Result<String, String>),
+    Transcript {
+        generation: u64,
+        result: Result<String, String>,
+    },
+}
+
+struct TranscribeJob {
+    generation: u64,
+    audio: Vec<f32>,
 }
 
 struct App {
@@ -65,11 +96,19 @@ struct App {
     hud: Arc<Hud>,
     tray: Tray,
     paused: Arc<AtomicBool>,
-    jobs: Sender<Vec<f32>>,
+    jobs: Sender<TranscribeJob>,
     results: Receiver<WorkerEvent>,
     state: State,
     started_at: Instant,
     model_ready: bool,
+    generation: u64,
+    pending: usize,
+    released: bool,
+    partials: Vec<String>,
+    chunk: Vec<f32>,
+    cursor: usize,
+    heard_speech: bool,
+    silence_at: Option<Instant>,
 }
 
 impl App {
@@ -97,20 +136,80 @@ impl App {
         if self.paused.load(Ordering::Acquire) || self.recorder.is_active() {
             return;
         }
+        self.reset_take();
         self.recorder.start_take();
         self.started_at = Instant::now();
         self.set_state(State::Recording, "");
         info!("recording started");
     }
 
+    fn reset_take(&mut self) {
+        self.generation += 1;
+        self.pending = 0;
+        self.released = false;
+        self.partials.clear();
+        self.chunk.clear();
+        self.cursor = 0;
+        self.heard_speech = false;
+        self.silence_at = None;
+    }
+
+    fn flush_chunk(&mut self) {
+        let audio = trim_silence(&self.chunk).to_vec();
+        self.chunk.clear();
+        self.silence_at = None;
+        if audio.len() < 1600 {
+            return;
+        }
+        let job = TranscribeJob {
+            generation: self.generation,
+            audio,
+        };
+        if self.jobs.send(job).is_ok() {
+            self.pending += 1;
+        }
+    }
+
+    /// Transcribe complete phrases while the key is still held, so release
+    /// only has to finish the short tail.
+    fn tick_streaming(&mut self) {
+        if !self.recorder.is_active() || !self.model_ready {
+            return;
+        }
+        let new_samples = self.recorder.new_chunk(&mut self.cursor);
+        self.chunk.extend_from_slice(&new_samples);
+
+        let level = self.recorder.level();
+        if level > 0.012 {
+            self.heard_speech = true;
+            self.silence_at = None;
+        } else if self.heard_speech && self.silence_at.is_none() {
+            self.silence_at = Some(Instant::now());
+        }
+
+        let quiet_long_enough = self
+            .silence_at
+            .map(|at| at.elapsed().as_millis() >= self.config.silence_ms as u128)
+            .unwrap_or(false);
+        let min_ok =
+            self.chunk.len() >= (self.config.min_chunk_seconds * 16_000.0) as usize;
+        let max_reached =
+            self.chunk.len() >= (self.config.chunk_seconds * 16_000.0) as usize;
+        if (quiet_long_enough && min_ok) || max_reached {
+            self.flush_chunk();
+        }
+    }
+
     fn caps_up(&mut self) {
         if !self.recorder.is_active() {
             return;
         }
-        let audio = self.recorder.stop_take();
+        let tail = self.recorder.stop_take_from(self.cursor);
+        self.chunk.extend_from_slice(&tail);
         let held = self.started_at.elapsed();
-        info!("recording stopped: {:.2}s", audio.len() as f32 / 16_000.0);
-        if held.as_millis() < self.config.min_hold_ms as u128 || audio.len() < 1600 {
+        info!("recording stopped: {:.2}s", held.as_secs_f32());
+        if held.as_millis() < self.config.min_hold_ms as u128 || self.chunk.len() < 1600 {
+            self.reset_take();
             self.set_state(
                 if self.model_ready {
                     State::Ready
@@ -121,9 +220,36 @@ impl App {
             );
             return;
         }
-        if self.jobs.send(audio).is_ok() {
+        self.flush_chunk();
+        self.released = true;
+        if self.pending == 0 {
+            self.finish_take();
+        } else {
             self.set_state(State::Transcribing, "");
         }
+    }
+
+    fn finish_take(&mut self) {
+        let joined = crate::cleanup::clean_transcript(&self.partials.join(" "));
+        self.reset_take();
+        if joined.trim().is_empty() {
+            self.set_state(State::Error, "NO SPEECH");
+            return;
+        }
+        if self.config.inject != "none" {
+            if let Err(err) = inject::insert_text(
+                &joined,
+                &self.config.inject,
+                self.config.char_delay_ms,
+                self.config.paste_delay_ms,
+                self.config.append_space,
+            ) {
+                tracing::error!("could not insert transcript: {err}");
+                self.set_state(State::Error, "INPUT BLOCKED");
+                return;
+            }
+        }
+        self.set_state(State::Ready, "");
     }
 
     fn poll_results(&mut self) {
@@ -135,28 +261,28 @@ impl App {
                         self.set_state(State::Ready, "");
                     }
                 }
-                WorkerEvent::Transcript(Ok(message)) if message.trim().is_empty() => {
-                    self.set_state(State::Error, "NO SPEECH");
+                WorkerEvent::Transcript { generation, .. } if generation != self.generation => {
+                    // Stale result from a previous take; ignore it.
+                    continue;
                 }
-                WorkerEvent::Transcript(Ok(message)) => {
-                    if self.config.inject != "none" {
-                        if let Err(err) = inject::insert_text(
-                            &message,
-                            &self.config.inject,
-                            self.config.char_delay_ms,
-                            self.config.paste_delay_ms,
-                            self.config.append_space,
-                        ) {
-                            tracing::error!("could not insert transcript: {err}");
-                            self.set_state(State::Error, "INPUT BLOCKED");
-                            continue;
+                WorkerEvent::Transcript { result, .. } => {
+                    self.pending = self.pending.saturating_sub(1);
+                    match result {
+                        Ok(text) => {
+                            if !text.trim().is_empty() {
+                                self.partials.push(text);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("transcription failed: {err}");
+                            self.reset_take();
+                            self.set_state(State::Error, "TRANSCRIPTION ERROR");
+                            return;
                         }
                     }
-                    self.set_state(State::Ready, "");
-                }
-                WorkerEvent::Transcript(Err(err)) => {
-                    tracing::error!("transcription failed: {err}");
-                    self.set_state(State::Error, "TRANSCRIPTION ERROR");
+                    if self.released && self.pending == 0 {
+                        self.finish_take();
+                    }
                 }
             }
         }
@@ -167,6 +293,7 @@ impl App {
         self.paused.store(now_paused, Ordering::Release);
         if now_paused {
             self.recorder.cancel();
+            self.reset_take();
             self.set_state(State::Paused, "");
         } else {
             self.set_state(
@@ -239,6 +366,7 @@ unsafe extern "system" fn wnd_proc(
         if !ptr.is_null() {
             let app = &mut *ptr;
             app.poll_results();
+            app.tick_streaming();
             if app.recorder.is_active() {
                 app.hud.push_level(app.recorder.level());
             }
@@ -345,7 +473,7 @@ fn run() -> Result<()> {
     let paused = Arc::new(AtomicBool::new(false));
     let _hook = HotkeyHook::start(hwnd, paused.clone())?;
 
-    let (job_tx, job_rx) = bounded::<Vec<f32>>(8);
+    let (job_tx, job_rx) = bounded::<TranscribeJob>(16);
     let (result_tx, result_rx) = bounded::<WorkerEvent>(8);
     let (model_tx, model_rx) = bounded::<Result<Arc<Transcriber>, String>>(1);
 
@@ -365,20 +493,32 @@ fn run() -> Result<()> {
         let transcriber = match model_rx.recv() {
             Ok(Ok(transcriber)) => transcriber,
             Ok(Err(err)) => {
-                let _ = result_worker.send(WorkerEvent::Transcript(Err(err)));
+                let _ = result_worker.send(WorkerEvent::Transcript {
+                    generation: 0,
+                    result: Err(err),
+                });
                 return;
             }
             Err(_) => return,
         };
         info!("English model ready");
-        if result_worker.send(WorkerEvent::Ready).is_err() {
+        if result_worker
+            .send(WorkerEvent::Ready)
+            .is_err()
+        {
             return;
         }
-        for audio in job_rx.iter() {
-            let text = transcriber
-                .transcribe(&audio)
+        for job in job_rx.iter() {
+            let result = transcriber
+                .transcribe(&job.audio)
                 .map_err(|err| err.to_string());
-            if result_worker.send(WorkerEvent::Transcript(text)).is_err() {
+            if result_worker
+                .send(WorkerEvent::Transcript {
+                    generation: job.generation,
+                    result,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -395,6 +535,14 @@ fn run() -> Result<()> {
         state: State::Loading,
         started_at: Instant::now(),
         model_ready: false,
+        generation: 0,
+        pending: 0,
+        released: false,
+        partials: Vec::new(),
+        chunk: Vec::new(),
+        cursor: 0,
+        heard_speech: false,
+        silence_at: None,
     });
     app.set_state(State::Loading, "");
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *app as *mut App) as isize) };
@@ -425,5 +573,20 @@ fn main() {
                 windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_silence;
+
+    #[test]
+    fn trim_silence_keeps_the_spoken_middle() {
+        let mut samples = vec![0.0; 1600];
+        samples.extend((0..3200).map(|i| (i as f32 / 3200.0).sin() * 0.2));
+        samples.extend(vec![0.0; 1600]);
+        let trimmed = trim_silence(&samples);
+        assert!(trimmed.len() >= 3000);
+        assert!(trimmed.len() < samples.len());
     }
 }

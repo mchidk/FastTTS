@@ -15,6 +15,12 @@ pub struct Config {
     pub threads: usize,
     pub initial_prompt: String,
     pub cleanup: bool,
+    /// Maximum seconds of audio per streaming chunk.
+    pub chunk_seconds: f32,
+    /// Flush a phrase after this much silence.
+    pub silence_ms: u64,
+    /// Never flush a chunk shorter than this.
+    pub min_chunk_seconds: f32,
     pub min_hold_ms: u64,
     pub max_record_seconds: u64,
     pub hot_mic: bool,
@@ -34,6 +40,9 @@ impl Default for Config {
             threads: 0,
             initial_prompt: String::new(),
             cleanup: true,
+            chunk_seconds: 4.0,
+            silence_ms: 350,
+            min_chunk_seconds: 0.8,
             min_hold_ms: 250,
             max_record_seconds: 120,
             hot_mic: true,
@@ -80,6 +89,21 @@ impl Config {
         if let Ok(v) = env::var("FASTTTS_CLEANUP") {
             self.cleanup = parse_bool(&v, self.cleanup);
         }
+        if let Ok(v) = env::var("FASTTTS_CHUNK_SECONDS") {
+            if let Ok(n) = v.parse() {
+                self.chunk_seconds = n;
+            }
+        }
+        if let Ok(v) = env::var("FASTTTS_SILENCE_MS") {
+            if let Ok(n) = v.parse() {
+                self.silence_ms = n;
+            }
+        }
+        if let Ok(v) = env::var("FASTTTS_MIN_CHUNK_SECONDS") {
+            if let Ok(n) = v.parse() {
+                self.min_chunk_seconds = n;
+            }
+        }
         if let Ok(v) = env::var("FASTTTS_MIN_HOLD_MS") {
             if let Ok(n) = v.parse() {
                 self.min_hold_ms = n;
@@ -118,6 +142,15 @@ impl Config {
             "initial_prompt has a NUL byte"
         );
         anyhow::ensure!(self.min_hold_ms <= 5000, "min_hold_ms must be <= 5000");
+        anyhow::ensure!(
+            (0.5..=10.0).contains(&self.chunk_seconds),
+            "chunk_seconds must be between 0.5 and 10"
+        );
+        anyhow::ensure!(self.silence_ms <= 3000, "silence_ms must be <= 3000");
+        anyhow::ensure!(
+            (0.1..=5.0).contains(&self.min_chunk_seconds),
+            "min_chunk_seconds must be between 0.1 and 5"
+        );
         anyhow::ensure!(
             self.max_record_seconds > 0,
             "max_record_seconds must be positive"

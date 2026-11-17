@@ -144,16 +144,37 @@ impl Recorder {
         self.state.active.store(true, Ordering::Release);
     }
 
-    pub fn stop_take(&self) -> Vec<f32> {
+    /// Return the samples captured since `cursor` (in device-rate samples),
+    /// resampled to 16 kHz, and advance the cursor. Used for streaming chunks.
+    pub fn new_chunk(&self, cursor: &mut usize) -> Vec<f32> {
+        let inner = self.state.inner.lock();
+        if *cursor > inner.take.len() {
+            *cursor = inner.take.len();
+        }
+        let pending = &inner.take[*cursor..];
+        *cursor = inner.take.len();
+        self.convert(pending)
+    }
+
+    /// Stop the take and return only the tail since `cursor`, resampled.
+    pub fn stop_take_from(&self, from: usize) -> Vec<f32> {
         let mut inner = self.state.inner.lock();
         inner.capturing = false;
         self.state.active.store(false, Ordering::Release);
         let mut samples = std::mem::take(&mut inner.take);
+        let start = from.min(samples.len());
+        let tail = samples.split_off(start);
+        self.convert(&tail)
+    }
+
+    fn convert(&self, samples: &[f32]) -> Vec<f32> {
         let rate = self.state.device_rate.load(Ordering::Relaxed);
-        if rate != SAMPLE_RATE && samples.len() >= 2 {
-            samples = resample(&samples, rate, SAMPLE_RATE);
-        }
-        samples.into_iter().take(self.state.max_samples).collect()
+        let converted = if rate != SAMPLE_RATE && samples.len() >= 2 {
+            resample(samples, rate, SAMPLE_RATE)
+        } else {
+            samples.to_vec()
+        };
+        converted.into_iter().take(self.state.max_samples).collect()
     }
 
     pub fn cancel(&self) {

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 - 2026-11-17
+
+### Added
+
+- Streaming transcription: while Caps Lock is held, complete phrases are
+  transcribed as soon as a short silence is detected, with a 4-second maximum
+  chunk. Partial transcripts are kept in memory, so releasing Caps Lock only
+  waits for the final tail instead of the whole utterance.
+- `chunk_seconds`, `silence_ms` and `min_chunk_seconds` config keys.
+
 ## 0.2.0 - 2026-11-17
 
 ### Changed
