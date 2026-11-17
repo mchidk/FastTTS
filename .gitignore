@@ -1,33 +1,22 @@
-# Byte-compiled / cache
-__pycache__/
-*.py[cod]
-*.pyd
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-*.egg-info/
-build/
-dist/
-.venv/
-venv/
+# Rust build
+/target/
+**/*.rs.bk
 
-# Bundled model weights: large, so keep them local and track only the manifest.
-models/*
-!models/faster-whisper-small.en/
-models/faster-whisper-small.en/*
-!models/faster-whisper-small.en/MANIFEST.json
-*.gguf
-*.safetensors
-*.pt
+# Local model weights: large; keep them locally, track only the manifest.
+/models/*
+!/models/whisper.cpp/
+/models/whisper.cpp/*
+!/models/whisper.cpp/MANIFEST.json
 *.bin
-*.pid
+*.gguf
+*.ggml
 
-# Generated audio and logs
+# Logs and generated audio
+*.log
 *.wav
 *.mp3
 *.flac
 *.ogg
-*.log
 
 # Local credentials and key material
 .env

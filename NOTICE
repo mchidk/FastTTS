@@ -2,55 +2,57 @@ FastTTS
 Copyright (c) 2026 Michael Christensen
 Licensed under the MIT License (see LICENSE).
 
-FastTTS is an independent project and is not affiliated with OpenAI or SYSTRAN.
+FastTTS is an independent project and is not affiliated with OpenAI, SYSTRAN or
+Zyphra.
 
 Runtime components
 ==================
 
-faster-whisper
-  Copyright SYSTRAN. Licensed under the MIT License.
-  https://github.com/SYSTRAN/faster-whisper
+whisper.cpp
+  MIT License. Native C/C++ inference engine used through whisper-rs.
+  https://github.com/ggml-org/whisper.cpp
 
-Whisper small.en model (Systran/faster-whisper-small.en)
-  Derived from OpenAI Whisper. Whisper and the converted weights are released
-  under the MIT License. The model is bundled locally in
-  models/faster-whisper-small.en for this checkout.
-  https://huggingface.co/Systran/faster-whisper-small.en
+ggml-small.en model
+  Derived from OpenAI Whisper (MIT). The ggml/GGUF conversion is distributed by
+  ggerganov under MIT. Bundled locally under models/whisper.cpp.
+  https://huggingface.co/ggerganov/whisper.cpp
 
-CTranslate2
-  Copyright OpenNMT. Licensed under the MIT License.
-  https://github.com/OpenNMT/CTranslate2
+whisper-rs / whisper-rs-sys
+  MIT / Unlicense. Rust bindings and build glue for whisper.cpp.
+  https://codeberg.org/tazz4843/whisper-rs
 
-PyAV / FFmpeg
-  PyAV is BSD-3-Clause; FFmpeg is LGPL-2.1-or-later by default.
-  https://github.com/PyAV-Org/PyAV
+cpal
+  MIT License. Cross-platform audio I/O; WASAPI on Windows.
+  https://github.com/RustAudio/cpal
 
-onnxruntime
-  Copyright Microsoft. Licensed under the MIT License.
-  https://github.com/microsoft/onnxruntime
+clipboard-win
+  MIT License. Windows clipboard helpers.
+  https://github.com/DoumanAsh/clipboard-win
 
-Hugging Face Hub and tokenizers
-  Apache License 2.0.
-  https://github.com/huggingface/huggingface_hub
-  https://github.com/huggingface/tokenizers
+windows-rs
+  MIT License. Windows API bindings.
+  https://github.com/microsoft/windows-rs
 
-pystray
-  Licensed under the GNU Lesser General Public License v3.0.
-  https://github.com/moses-palmer/pystray
+tracing / tracing-subscriber / tracing-appender
+  MIT License. Structured logging.
+  https://github.com/tokio-rs/tracing
 
-Pillow
-  Licensed under the HPND License.
-  https://python-pillow.org
+image
+  MIT License. PNG decoding for the HUD.
+  https://github.com/image-rs/image
 
-numpy
-  BSD-3-Clause.
-  https://numpy.org
+regex / serde / toml / anyhow / crossbeam-channel / parking_lot
+  MIT or Apache-2.0 licenses. Standard Rust utility crates.
 
-sounddevice
-  MIT License; bundles PortAudio (MIT-like).
-  https://python-sounddevice.readthedocs.io
+### Bundled runtime DLLs
 
-No model weights or native binaries are committed to the FastTTS repository.
-The English Whisper model is bundled locally under models/faster-whisper-small.en;
-it is excluded from Git because of its size and remains subject to its own
-license.
+The Windows GNU build ships `libstdc++-6.dll`, `libgcc_s_seh-1.dll` and
+`libwinpthread-1.dll` from MinGW-w64. They are copied next to `fasttts.exe` by
+`install-shortcut.ps1` so the app runs on a clean Windows install. libstdc++ is
+GPLv3 with the GCC Runtime Library Exception; libgcc and winpthreads use the
+GCC runtime exception / LGPL terms.
+
+No Python code, model weights or third-party binaries are committed to the Rust
+repository except those three small runtime DLLs. The ggml English model is
+bundled locally in models/whisper.cpp/ggml-small.en.bin and excluded from Git
+because of size.

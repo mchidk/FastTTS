@@ -1,173 +1,106 @@
-# FastTTS
+# FastTTS — Rust edition
 
-**Hold Caps Lock. Talk. Let go. Your words are typed.**
+**Hold Caps Lock. Talk. Let go. The words appear.**
 
-FastTTS is a small, English-only dictation app for Windows. It sits in the
-system tray, records while Caps Lock is held, transcribes locally with
-Whisper `small.en`, and types the result into whatever window has focus.
+This `dev` branch is a ground-up Rust rewrite of FastTTS. It is the same tiny
+English dictation app as the Python `main` branch, but native: no Python
+runtime, no PyTorch, no Hugging Face client, no CLI, no TTS.
 
-No window to manage. No CLI. No cloud. No text-to-speech. Just push-to-talk.
+## Why it is faster
 
-## Why it is fast
-
-- English only, so there is no language detector and no model router.
-- One bundled model: Whisper `small.en` at int8, beam size 1, with VAD.
-- The model loads once in the background and stays warm.
-- The microphone stream stays open with a 250 ms pre-roll, so the first word
-  is not lost and the first take starts instantly.
-- Takes are transcribed off the keyboard thread; you can start the next take
-  while the previous one is still being pasted.
+- Native Rust binary: no interpreter startup and no import cascade.
+- `whisper-rs` / `whisper.cpp` with a locally bundled `ggml-small.en` model,
+  CPU-only int8, greedy decoding, English forced.
+- Model loads once in the background; the tray appears immediately.
+- Persistent microphone stream with a 250 ms pre-roll, so a take starts
+  with the first word and no device-open latency.
+- One Win32 message loop drives the tray, Caps Lock hook and HUD; transcription
+  runs on its own worker thread and never blocks input.
 
 ## The oscilloscope HUD
 
-A small, click-through oscilloscope sits just above the taskbar while you
-dictate. It never steals focus and never appears in Alt-Tab.
-
-- **LISTENING** with live microphone bars while Caps Lock is held.
-- **TRANSCRIBING** with a scanning pulse while Whisper works.
-- **ERROR** with a short message when no speech was recognized or the
-  microphone/input is unavailable.
-
-It fades away when the take is done. Set `hud = false` to turn it off.
+A small, click-through oscilloscope sits above the taskbar while you dictate.
+It shows live microphone bars while listening, a scanning pulse while
+transcribing, and a short error message when needed. It fades away when done.
 
 ![FastTTS listening HUD](docs/assets/hud-listening.png)
 ![FastTTS transcribing HUD](docs/assets/hud-transcribing.png)
 ![FastTTS error HUD](docs/assets/hud-error.png)
 
+Set `hud = false` in the config to turn it off.
+
 ## Requirements
 
 - Windows 11 x64.
-- Python 3.11 or newer.
-- A working microphone and the default output device (for the short cues).
-- The bundled English model in `models/faster-whisper-small.en` (about 464 MB).
-  It ships with this checkout; nothing is downloaded at runtime.
+- Rust stable with the `x86_64-pc-windows-msvc` toolchain (1.88+).
+- Visual Studio 2022 Build Tools with **Desktop development with C++**.
+- CMake and LLVM/libclang on `PATH` (needed to build `whisper.cpp` and its
+  bindings).
+- The bundled English model in `models/whisper.cpp/ggml-small.en.bin`
+  (~488 MB). It ships with this checkout and is excluded from Git.
+- The MinGW runtime DLLs in `runtime/` are copied next to the release exe by
+  `install-shortcut.ps1`; FastTTS runs without MinGW on `PATH`.
 
-FastTTS is self-contained on disk: the app code and the English model live in
-this folder. It does not use a global model cache, and it never downloads
-anything while running.
-
-## Install and run
+## Build and run
 
 ```powershell
-cd C:\repros\FastTTS
-python -m pip install -e ".[dev]"
-.\start-fasttts.cmd
+cargo build --release
+.\target\x86_64-pc-windows-gnu\release\fasttts.exe
 ```
 
-`start-fasttts.cmd` uses `pythonw`, so no console window stays open. The tray
-icon appears immediately while the bundled English model loads in the
-background.
-
-The model folder is too large for Git, so it is excluded from the repository.
-Keep `models/faster-whisper-small.en` beside `src/` when you copy, move or
-archive FastTTS.
+The desktop shortcut points to the release executable and uses
+`assets/fasttts.ico`. To rebuild the shortcut after moving the checkout, run
+`install-shortcut.ps1` (if present) or recreate it manually.
 
 ## Use
 
 1. Put the cursor where the text should go.
-2. **Hold Caps Lock** and speak English.
+2. Hold **Caps Lock** and speak English.
 3. Release Caps Lock.
 
-The tray icon turns red while recording and amber while transcribing. The
-transcript is pasted at the caret and a space is appended. Hold-to-talk always
-wins: Caps Lock never toggles the keyboard state.
+The transcript is pasted at the caret with a trailing space. The default
+insertion method is an atomic clipboard paste, so the new Windows 11 Notepad
+cannot drop key-up events and repeat characters. Set `inject = "sendinput"`
+for apps that ignore `Ctrl+V`; FastTTS then types with tagged Unicode events
+and falls back to paste if input is blocked.
 
-- Taps shorter than 250 ms are discarded silently.
-- **Pause dictation** in the tray menu lets Caps Lock behave normally again.
-- **Open log** opens `%LOCALAPPDATA%\FastTTS\logs`.
-- **Quit** stops the hook and closes the microphone.
+Tray menu:
 
-Only one FastTTS instance can run at a time.
+- **Pause/Resume** — Caps Lock behaves normally again while paused.
+- **Open log** — opens `%LOCALAPPDATA%\FastTTS\logs`.
+- **Quit** — stops the hook and closes the microphone.
 
 ## Configuration
 
-FastTTS runs with good defaults. To change something, create:
-
-```text
-%APPDATA%\FastTTS\config.toml
-```
-
-Every key is optional:
+Optional TOML at `%APPDATA%\FastTTS\config.toml`. Every key is optional.
+Environment variables such as `FASTTTS_HUD=false` or `FASTTTS_MIC_DEVICE=2`
+override individual keys.
 
 ```toml
-# Speech recognition
-model = ""                  # "" = the bundled English model
-device = "cpu"              # cpu, cuda or auto
-compute_type = "int8"       # int8 on CPU; float16 on CUDA
-cpu_threads = 0             # 0 = let CTranslate2 choose
-beam_size = 1               # 1 is fastest
-vad = true                  # trim silence
-initial_prompt = ""         # optional spelling/name hint
-cleanup = true              # remove "um", "uh" and simple stutters
-model_dir = ""              # optional cache folder for an override model
-
-# Microphone and Caps Lock
-mic_device = ""             # "" = Windows default; or an index or name
-min_hold_ms = 250           # shorter taps are discarded
+model = ""                 # "" = the bundled ggml-small.en.bin
+threads = 0                # 0 = choose automatically
+initial_prompt = ""
+cleanup = true
+min_hold_ms = 250
 max_record_seconds = 120
-hot_mic = true              # keep the microphone open
-sounds = false              # optional stop/error cues
-hud = true                  # oscilloscope above the taskbar
-
-# Text insertion
-inject = "clipboard"        # clipboard (reliable) or sendinput
-char_delay_ms = 10          # only used by sendinput
-paste_delay_ms = 400        # wait for the target to process Ctrl+V
+hot_mic = true
+sounds = false
+hud = true
+inject = "clipboard"       # clipboard, sendinput or none
+char_delay_ms = 10
+paste_delay_ms = 400
 append_space = true
+mic_device = ""            # "" = Windows default
 ```
 
-Environment variables override individual keys, for example
-`FASTTTS_MIC_DEVICE=2` or `FASTTTS_CLEANUP=false`.
+## Not included
 
-The default uses an atomic clipboard paste (`Ctrl+V`), which avoids the
-key-up loss that per-character synthetic typing can cause in the new Windows 11
-Notepad. The previous clipboard text is restored after the paste. Set
-`inject = "sendinput"` for apps that ignore paste; FastTTS then types at 10 ms
-per character and falls back to the clipboard if input is blocked.
-
-`inject = "none"` recognises speech and writes it to the log without typing;
-useful for testing a microphone without touching the focused app.
-
-## What is intentionally not included
-
-- Text-to-speech, Studio, voices, emotions, prosody or audio files.
 - Speech-to-text for any language other than English.
-- A CLI, server commands, model management commands or update checks.
-- A floating window or tray animations beyond the small dictation HUD.
-- Custom hotkeys, voice profiles, cloud APIs or accounts.
-
-FastTTS is deliberately small: one microphone, one English model, one
-behaviour. See [NOTICE](NOTICE) for third-party components.
-
-## Troubleshooting
-
-- **Nothing is inserted.** Some elevated (administrator) windows reject synthetic
-  input. FastTTS tries the other insertion method automatically. If both are
-  blocked, run FastTTS at the same elevation as the target app. If an app
-  ignores `Ctrl+V`, set `inject = "sendinput"`.
-- **"Model unavailable".** Check that `models/faster-whisper-small.en/model.bin`
-  exists and is about 484 MB. FastTTS loads it from the local folder and never
-  downloads it.
-- **No microphone.** Windows Settings → Privacy → Microphone must allow desktop
-  apps. Set `mic_device` to a specific device if the default is wrong.
-- **Caps Lock hook unavailable.** Another keyboard tool may be swallowing the
-  key, or the process may lack desktop-session access. Restart the tray app.
-- **Wrong spelling of a name.** Put it in `initial_prompt`, for example
-  `initial_prompt = "OpenCode, FastTTS, Michael"`.
-
-## Development
-
-```powershell
-$env:PYTHONPATH = "src"
-python -m ruff check src tests
-python -m ruff format --check src tests
-python -m pytest
-```
-
-The tests are offline. They use fake recorders, fake models and temporary
-files; they never open a microphone, load Whisper or type into a window.
+- Text-to-speech, voices, Studio, emotion presets, audio files.
+- A CLI, server, Hugging Face downloads, model management or update checks.
+- Global hotkeys other than Caps Lock, or any floating window beyond the HUD.
 
 ## License
 
-MIT for the FastTTS code. Third-party components and the Whisper model have
-their own licenses; see [NOTICE](NOTICE).
+MIT for the Rust code. The whisper.cpp engine, the ggml English model and the
+remaining crates keep their own licenses; see [NOTICE](NOTICE).

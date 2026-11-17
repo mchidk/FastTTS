@@ -1,8 +1,19 @@
 # Changelog
 
-All notable changes to FastTTS are listed here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions use
-[Semantic Versioning](https://semver.org/).
+## 0.2.0 - 2026-11-17
+
+### Changed
+
+- Complete Rust rewrite on the `dev` branch.
+- Native `whisper-rs` / `whisper.cpp` engine with the bundled `ggml-small.en`
+  model. No Python runtime, no PyTorch, no Hugging Face client.
+- One Win32 message loop for the Caps Lock hook, tray icon and HUD; a separate
+  worker thread handles transcription.
+- Atomic clipboard paste by default with tagged Unicode SendInput fallback,
+  preventing repeated-character corruption in Windows 11 Notepad.
+- Rebuilt layered HUD with live microphone bars and clean flat PNG assets with
+  no shadows or outlines.
+- Desktop shortcut now launches the native release executable.
 
 ## 0.1.2 - 2026-11-16
 
@@ -17,38 +28,13 @@ All notable changes to FastTTS are listed here. The format follows
 ### Fixed
 
 - Corrupted or repeated characters in Windows 11 Notepad. Fast per-character
-  SendInput at 1 ms could lose key-up events, producing text like
-  "wwwwwwww" and "iiiiiiii" with gaps. Clipboard paste is now the default:
-  it is atomic, verifies the clipboard before sending Ctrl+V, waits 400 ms,
-  and restores the previous clipboard only if it is still ours.
-- SendInput remains available with a safer 10 ms per-character delay, and
-  automatically falls back to the clipboard if synthetic input is blocked.
-- Clipboard fallback now reports an error instead of pasting stale clipboard
-  contents when the clipboard cannot be updated.
+  SendInput at 1 ms could lose key-up events. Clipboard paste is now the
+  default, verifies the clipboard, waits 400 ms and restores the previous
+  clipboard only if it is still ours.
+- SendInput remains available at 10 ms with automatic fallback.
 - 76 offline tests.
 
 ## 0.1.0 - 2026-11-16
 
-First release: a lean, English-only dictation app for Windows.
-
-### Added
-
-- Hold Caps Lock to dictate; release to transcribe and type at the caret.
-- Self-contained English Whisper `small.en` model under
-  `models/faster-whisper-small.en`; no external cache or runtime download is
-  needed.
-- English-only `small.en` at int8 with beam size 1 and VAD.
-- Persistent microphone stream with a 250 ms pre-roll, so the first word is
-  not lost and takes start instantly.
-- Background model warm-up; the tray icon is available immediately.
-- Conservative filler/stutter cleanup (`um`, `uh`, "I I think").
-- Tray menu with status, Pause dictation, Open log and Quit.
-- On-screen oscilloscope HUD with live microphone bars while listening, a
-  scanning pulse while transcribing, and short error messages.
-- README screenshots of the listening, transcribing and error HUD states.
-- Short stop/error cues, off by default; set `sounds = true` to enable.
-- Single-instance guard and rotating file log.
-- Clipboard fallback when SendInput is blocked, plus a `clipboard` mode and an
-  `inject = "none"` test mode.
-- 74 offline tests for hold-to-talk, recording buffers, cleanup, injection
-  events, configuration, transcription arguments, app state and the HUD API.
+First release of the Python implementation: hold Caps Lock to dictate English,
+with a bundled faster-whisper small.en model, tray app and oscilloscope HUD.
