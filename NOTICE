@@ -23,9 +23,9 @@ cpal / clipboard-win / windows-rs / image / regex / serde / toml
 Bundled runtime DLLs
 ====================
 
-The Windows gnullvm build needs `libc++.dll` from LLVM MinGW for the Cactus
-engine. It is bundled in `runtime/` and copied next to `fasttts.exe` by
-`install-shortcut.ps1`.
+The Windows gnullvm build needs `libc++.dll` and `libunwind.dll` from LLVM
+MinGW for the Cactus engine. Both are bundled in `runtime/` and copied next
+to `fasttts.exe` by `install-shortcut.ps1`.
 
 The 16.9 MB Whistle model is bundled locally for this checkout but excluded
 from Git because model binaries are not source. No other model weights are

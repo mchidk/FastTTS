@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 - 2026-11-18
+
+### Fixed
+
+- Bundled `libunwind.dll` alongside `libc++.dll`. The Cactus engine needs both
+  LLVM MinGW runtime DLLs; without `libunwind.dll` Windows showed
+  "The code executor cannot proceed because libunwind.dll was not found".
+
 ## 0.3.0 - 2026-11-18
 
 ### Changed
