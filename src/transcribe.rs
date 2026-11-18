@@ -141,6 +141,60 @@ pub(crate) mod tests {
         // Silence never reaches the model.
         let (text, chunks) = stream_take(&mut model, &vec![0.0; 48_000], laptop);
         assert!(text.is_empty() && chunks == 0);
+
+        long_dictation(&mut model, &speech, laptop);
+    }
+
+    /// A minute of soft speech with only short breaths, replayed on the real
+    /// timeline: chunks reach the model while the key is held, and the wait
+    /// after release is whatever the model has not finished by then.
+    fn long_dictation(model: &mut Transcriber, speech: &[f32], threshold: f32) {
+        let mut audio = Vec::new();
+        for _ in 0..5 {
+            audio.extend(speech.iter().map(|x| x * 0.03));
+            audio.extend(std::iter::repeat_n(0.0, 4_800)); // 0.3 s breath
+        }
+        // Let go right on the last word: the worst case for the wait.
+        let last_word = audio.iter().rposition(|x| x.abs() > 0.002).unwrap_or(0);
+        audio.truncate(last_word + 1);
+        let config = crate::config::Config::default();
+        let mut chunker = Chunker::new(config.chunk_seconds, config.silence_ms, threshold);
+        let mut busy_until = 0f32; // model timeline, seconds of audio time
+        let mut parts = Vec::new();
+        let mut longest = 0f32;
+        let mut transcribe = |chunk: crate::stream::Chunk, now: f32, busy: &mut f32| {
+            longest = longest.max(chunk.audio.len() as f32 / 16_000.0);
+            let start = Instant::now();
+            let text = model.transcribe(&chunk.audio).unwrap();
+            *busy = busy.max(now) + start.elapsed().as_secs_f32();
+            parts.push((text, chunk.continues));
+        };
+        for (i, slice) in audio.chunks(528).enumerate() {
+            let now = (i + 1) as f32 * 528.0 / 16_000.0;
+            let mut ready = Vec::new();
+            chunker.push(slice, &mut ready);
+            for chunk in ready {
+                transcribe(chunk, now, &mut busy_until);
+            }
+        }
+        let end = audio.len() as f32 / 16_000.0;
+        if let Some(tail) = chunker.finish() {
+            transcribe(tail, end, &mut busy_until);
+        }
+        let wait = (busy_until - end).max(0.0);
+        let text = crate::cleanup::clean_transcript(&join(&parts));
+        let reference = [REFERENCE; 5].join(" ");
+        let error = wer(&reference, &text);
+        println!(
+            "long ({end:.0}s, {} chunks, longest {longest:.1}s): wait after release {:.0} ms, WER {:.1}%",
+            parts.len(),
+            wait * 1000.0,
+            error * 100.0
+        );
+        assert!(parts.len() >= 8, "a minute must stream in many chunks");
+        assert!(longest <= config.chunk_seconds + 0.05);
+        assert!(wait < 0.6, "release must not wait for the whole minute");
+        assert!(error < 0.1, "long: {text}");
     }
 
     /// Run audio through the chunker and model exactly as a take does:
