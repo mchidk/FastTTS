@@ -1,6 +1,6 @@
 [package]
 name = "fasttts"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Fast native English dictation for Windows: hold Caps Lock to speak"
 
@@ -13,6 +13,7 @@ strip = true
 
 [dependencies]
 anyhow = "1"
+cactus-rs = "0.2"
 clipboard-win = "5.4.3"
 cpal = "0.18.2"
 crossbeam-channel = "0.5"
@@ -24,12 +25,6 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "std"] }
 tracing-appender = "0.2"
-whisper-rs = { version = "0.15.1", default-features = false }
-
-# Local patch: pre-generated bindings have MSVC CRT layout assertions; the
-# three MinGW CRT sizes differ, so whisper-rs-sys is vendored with fixed ones.
-[patch.crates-io]
-whisper-rs-sys = { path = "vendor/whisper-rs-sys" }
 
 [dependencies.windows]
 version = "0.62.2"

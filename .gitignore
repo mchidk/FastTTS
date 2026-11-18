@@ -4,10 +4,9 @@
 
 # Local model weights: large; keep them locally, track only the manifest.
 /models/*
-!/models/whisper.cpp/
-/models/whisper.cpp/*
-!/models/whisper.cpp/MANIFEST.json
-*.bin
+!/models/cactus/
+/models/cactus/*
+!/models/cactus/MANIFEST.json
 *.gguf
 *.ggml
 

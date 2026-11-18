@@ -475,7 +475,7 @@ fn run() -> Result<()> {
 
     let (job_tx, job_rx) = bounded::<TranscribeJob>(16);
     let (result_tx, result_rx) = bounded::<WorkerEvent>(8);
-    let (model_tx, model_rx) = bounded::<Result<Arc<Transcriber>, String>>(1);
+    let (model_tx, model_rx) = bounded::<Result<Transcriber, String>>(1);
 
     let model_path = model.clone();
     let threads = config.threads;
@@ -483,14 +483,13 @@ fn run() -> Result<()> {
     let cleanup = config.cleanup;
     thread::spawn(move || {
         let outcome = Transcriber::new(&model_path, threads, &prompt, cleanup)
-            .map(Arc::new)
             .map_err(|err| err.to_string());
         let _ = model_tx.send(outcome);
     });
 
     let result_worker = result_tx.clone();
     thread::spawn(move || {
-        let transcriber = match model_rx.recv() {
+        let mut transcriber = match model_rx.recv() {
             Ok(Ok(transcriber)) => transcriber,
             Ok(Err(err)) => {
                 let _ = result_worker.send(WorkerEvent::Transcript {

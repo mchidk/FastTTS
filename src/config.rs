@@ -9,7 +9,7 @@ use std::{env, fs, path::PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Empty means the bundled fast ggml-base.en model.
+    /// Empty means the bundled 16.9 MB Cactus Whistle model.
     pub model: String,
     /// 0 = let whisper.cpp choose.
     pub threads: usize,
@@ -166,7 +166,7 @@ impl Config {
         if !self.model.is_empty() {
             return PathBuf::from(&self.model);
         }
-        project_root().join("models/whisper.cpp/ggml-base.en.bin")
+        project_root().join("models/cactus/whistle.cact")
     }
 }
 
@@ -202,16 +202,18 @@ pub fn project_root() -> PathBuf {
         return PathBuf::from(root);
     }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if cwd.join("models/whisper.cpp").is_dir() {
-        return cwd;
-    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fasttts.exe"));
-    let dir = exe.parent().unwrap_or(&exe).to_path_buf();
-    // target/release/fasttts.exe -> project root; also accept exe beside models.
-    for candidate in [dir.clone(), dir.join("../..").join("..")] {
-        if candidate.join("models/whisper.cpp").is_dir() {
-            return candidate;
+    let exe_dir = exe.parent().unwrap_or(&exe).to_path_buf();
+    for start in [cwd, exe_dir] {
+        let mut candidate = start;
+        loop {
+            if candidate.join("models/cactus/whistle.cact").is_file() {
+                return candidate;
+            }
+            if !candidate.pop() {
+                break;
+            }
         }
     }
-    dir
+    exe.parent().unwrap_or(&exe).to_path_buf()
 }

@@ -3,7 +3,7 @@ param(
 )
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exe = Join-Path $root 'target\x86_64-pc-windows-gnu\release\fasttts.exe'
+$exe = Join-Path $root 'target\x86_64-pc-windows-gnullvm\release\fasttts.exe'
 $icon = Join-Path $root 'assets\fasttts.ico'
 
 if (-not (Test-Path $exe)) {

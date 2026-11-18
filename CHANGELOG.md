@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 - 2026-11-18
+
+### Changed
+
+- Replaced whisper.cpp / whisper-rs with Cactus **Whistle**: one 16.9 MB model
+  instead of 148–488 MB of ggml weights, no CMake/libclang build step and no
+  vendored C++ engine.
+- Removed `vendor/whisper-rs-sys`, all ggml models and the old MinGW/GNU
+  build configuration. The app now builds for `x86_64-pc-windows-gnullvm`.
+- Much smaller dependency tree and faster startup/transcription.
+
 ## 0.2.3 - 2026-11-18
 
 ### Fixed
