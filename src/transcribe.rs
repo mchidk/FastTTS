@@ -1,117 +1,156 @@
-//! English dictation with Cactus Whistle: 16.9 MB, CPU-only, no whisper.cpp.
+//! English speech-to-text with Cactus Whistle, embedded in the executable.
 
 use anyhow::{Context, Result};
 use cactus_rs::whistle::{Language, TranscribeOptions, Weights, Whistle};
-use std::path::Path;
 
-/// Cheap energy gate: keep silence and room noise away from the model.
-pub(crate) fn has_speech(samples: &[f32]) -> bool {
-    const MIN_SAMPLES: usize = 1600;
-    const FRAME: usize = 160;
-    const RMS_FLOOR: f32 = 0.012;
-    const PEAK_FLOOR: f32 = 0.05;
-    const MIN_VOICED_FRAMES: usize = 3;
+/// The 16.9 MB Whistle model (Apache-2.0), see NOTICE.
+static MODEL: &[u8] = include_bytes!("../models/whistle.cact");
 
-    if samples.len() < MIN_SAMPLES {
-        return false;
-    }
-    let mut voiced = 0usize;
-    let mut peak = 0f32;
-    for frame in samples.chunks(FRAME) {
-        let sum: f64 = frame.iter().map(|&x| x as f64 * x as f64).sum();
-        let rms = (sum / frame.len() as f64).sqrt() as f32;
-        peak = peak.max(frame.iter().fold(0f32, |m, &x| m.max(x.abs())));
-        if rms > RMS_FLOOR {
-            voiced += 1;
-        }
-    }
-    voiced >= MIN_VOICED_FRAMES || (peak > PEAK_FLOOR && voiced > 0)
-}
+/// Quiet takes are raised to this peak before transcription.
+const TARGET_PEAK: f32 = 0.5;
+/// Never amplify more than this (+20 dB), so room noise stays noise.
+const MAX_GAIN: f32 = 10.0;
 
 pub struct Transcriber {
     whistle: Whistle,
     options: TranscribeOptions,
-    cleanup: bool,
 }
 
 impl Transcriber {
-    pub fn new(model: &Path, _threads: usize, _prompt: &str, cleanup: bool) -> Result<Self> {
-        let weights = Weights::from_file(model)
-            .with_context(|| format!("could not load Whistle weights {}", model.display()))?;
+    pub fn load() -> Result<Self> {
+        let weights = Weights::from_bytes(MODEL).context("the embedded model is damaged")?;
         let whistle = Whistle::builder(weights)
             .build()
-            .context("could not build the Whistle engine")?;
-        let options = TranscribeOptions::new().with_language(Language::En);
+            .context("could not start the Whistle engine")?;
         Ok(Self {
             whistle,
-            options,
-            cleanup,
+            options: TranscribeOptions::new().with_language(Language::En),
         })
     }
 
+    /// Transcribe one chunk of 16 kHz mono audio.
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
-        if samples.len() < 1600 || !has_speech(samples) {
+        if !crate::stream::has_speech(samples) {
             return Ok(String::new());
         }
+        let audio = normalize(samples);
         let transcript = self
             .whistle
-            .transcribe_with_options(samples, &self.options)
-            .context("Whistle transcription failed")?;
-        let text = transcript.text().trim().to_string();
-        Ok(if self.cleanup {
-            crate::cleanup::clean_transcript(&text)
-        } else {
-            text
-        })
+            .transcribe_with_options(&audio, &self.options)
+            .context("transcription failed")?;
+        Ok(transcript.text().trim().to_string())
     }
 }
 
+/// Bring quiet speech up to a consistent level.
+fn normalize(samples: &[f32]) -> Vec<f32> {
+    let peak = samples.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let gain = if peak > 0.0 {
+        (TARGET_PEAK / peak).clamp(1.0, MAX_GAIN)
+    } else {
+        1.0
+    };
+    samples.iter().map(|x| x * gain).collect()
+}
+
 #[cfg(test)]
-mod tests {
-    use super::{has_speech, Transcriber};
-    use crate::config::Config;
+pub(crate) mod tests {
+    use super::*;
+    use crate::stream::{join, Chunker};
     use std::time::Instant;
 
-    #[test]
-    fn speech_gate_rejects_noise_and_accepts_voice() {
-        assert!(!has_speech(&[]));
-        assert!(!has_speech(&vec![0.0f32; 1600]));
-        for amp in [0.002f32, 0.004, 0.008, 0.012] {
-            let noise: Vec<f32> = (0..16_000)
-                .map(|i| {
-                    let x = ((i as u32).wrapping_mul(2_654_435_761) % 65_536) as f32 / 32_768.0
-                        - 1.0;
-                    x * amp
-                })
-                .collect();
-            assert!(!has_speech(&noise), "room noise {amp} must be gated");
-        }
-        let tone: Vec<f32> = (0..16_000)
-            .map(|i| (i as f32 * 0.05).sin() * 0.1)
-            .collect();
-        assert!(has_speech(&tone));
+    /// The 16 kHz mono 16-bit speech fixture in `tests/fixtures`.
+    pub(crate) fn speech() -> Vec<f32> {
+        let bytes = include_bytes!("../tests/fixtures/speech.wav");
+        let data = bytes
+            .windows(4)
+            .position(|w| w == b"data")
+            .expect("data chunk")
+            + 8;
+        bytes[data..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect()
     }
 
-    #[test]
-    fn transcribes_silence_instantly_and_speech_correctly() {
-        // Whistle is process-global, so all model tests share one instance.
-        let mut transcriber = Transcriber::new(&Config::default().model_path(), 0, "", true)
-            .expect("whistle model");
-        let silence = vec![0.0f32; 16_000 * 2];
-        let start = Instant::now();
-        let text = transcriber.transcribe(&silence).expect("silence");
-        assert!(text.is_empty());
-        assert!(start.elapsed().as_millis() < 50);
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .filter(|w| !w.is_empty())
+            .collect()
+    }
 
-        let bytes = match std::fs::read(r"C:\repros\notes\speech4s.f32") {
-            Ok(bytes) => bytes,
-            Err(_) => return, // optional fixture
-        };
-        let speech: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    /// Word error rate of `hypothesis` against `reference` (Levenshtein).
+    fn wer(reference: &str, hypothesis: &str) -> f32 {
+        let (r, h) = (words(reference), words(hypothesis));
+        let mut row: Vec<usize> = (0..=h.len()).collect();
+        for i in 1..=r.len() {
+            let mut previous = row[0];
+            row[0] = i;
+            for j in 1..=h.len() {
+                let current = row[j];
+                let cost = usize::from(r[i - 1] != h[j - 1]);
+                row[j] = (row[j] + 1).min(row[j - 1] + 1).min(previous + cost);
+                previous = current;
+            }
+        }
+        row[h.len()] as f32 / r.len() as f32
+    }
+
+    const REFERENCE: &str = "Please send the quarterly report to the finance team before \
+        Friday. I will review the numbers on Monday morning, and then we can schedule a meeting \
+        with the whole department to discuss the budget for next year.";
+
+    /// One test owns the model: Whistle allows a single engine per process.
+    #[test]
+    fn transcribes_whole_streamed_and_quiet_speech() {
+        let mut model = Transcriber::load().expect("model");
+
+        let start = Instant::now();
+        assert!(model.transcribe(&vec![0.0; 32_000]).unwrap().is_empty());
+        assert!(
+            start.elapsed().as_millis() < 20,
+            "silence must skip the model"
+        );
+
+        let speech = speech();
+        let start = Instant::now();
+        let whole = crate::cleanup::clean_transcript(&model.transcribe(&speech).unwrap());
+        let seconds = start.elapsed().as_secs_f32();
+        let audio_seconds = speech.len() as f32 / 16_000.0;
+        println!("whole ({seconds:.2}s for {audio_seconds:.1}s): {whole}");
+        assert!(wer(REFERENCE, &whole) < 0.15, "whole: {whole}");
+
+        // Stream exactly as the app does: 33 ms slices, default settings.
+        let config = crate::config::Config::default();
+        let mut chunker = Chunker::new(config.chunk_seconds, config.silence_ms);
+        let mut chunks = Vec::new();
+        for slice in speech.chunks(528) {
+            chunker.push(slice, &mut chunks);
+        }
+        chunks.extend(chunker.finish());
+        assert!(chunks.len() >= 2, "the fixture must exercise streaming");
+        let tail = chunks.last().unwrap().audio.len() as f32 / 16_000.0;
+        let parts: Vec<(String, bool)> = chunks
+            .iter()
+            .map(|c| (model.transcribe(&c.audio).unwrap(), c.continues))
             .collect();
-        let text = transcriber.transcribe(&speech).expect("speech");
-        assert!(!text.trim().is_empty());
+        let streamed = crate::cleanup::clean_transcript(&join(&parts));
+        println!(
+            "streamed ({} chunks, {tail:.1}s tail): {streamed}",
+            chunks.len()
+        );
+        assert!(wer(REFERENCE, &streamed) < 0.2, "streamed: {streamed}");
+
+        // A quiet microphone (-26 dB) must still transcribe.
+        let quiet: Vec<f32> = speech.iter().map(|x| x * 0.05).collect();
+        let text = crate::cleanup::clean_transcript(&model.transcribe(&quiet).unwrap());
+        println!("quiet: {text}");
+        assert!(wer(REFERENCE, &text) < 0.2, "quiet: {text}");
     }
 }

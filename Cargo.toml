@@ -1,8 +1,12 @@
 [package]
 name = "fasttts"
-version = "0.3.1"
+version = "1.0.0"
 edition = "2021"
-description = "Fast native English dictation for Windows: hold Caps Lock to speak"
+rust-version = "1.88"
+description = "Hold Caps Lock, speak English, let go: fast local dictation for Windows"
+license = "MIT"
+repository = "https://github.com/mchidk/FastTTS"
+publish = false
 
 [profile.release]
 opt-level = 3
@@ -16,15 +20,12 @@ anyhow = "1"
 cactus-rs = "0.2"
 clipboard-win = "5.4.3"
 cpal = "0.18.2"
-crossbeam-channel = "0.5"
-image = { version = "0.25", default-features = false, features = ["png"] }
-parking_lot = "0.12"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "std"] }
-tracing-appender = "0.2"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dependencies.windows]
 version = "0.62.2"
@@ -37,3 +38,6 @@ features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ]
+
+[dev-dependencies]
+png = "0.18"

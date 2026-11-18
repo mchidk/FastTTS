@@ -1,4 +1,4 @@
-//! FastTTS: hold Caps Lock, speak English, release. Nothing else.
+//! FastTTS: hold Caps Lock, speak English, let go. The words appear.
 
 #![windows_subsystem = "windows"]
 
@@ -8,584 +8,607 @@ mod config;
 mod hook;
 mod hud;
 mod inject;
+mod stream;
 mod transcribe;
 mod tray;
 
 use anyhow::{anyhow, Result};
 use audio::Recorder;
 use config::Config;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use hook::HotkeyHook;
-use hud::{Hud, HudMode};
+use hook::{HotkeyHook, WM_CAPSLOCK};
+use hud::Hud;
 use std::{
-    process::Command,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
+    cell::RefCell,
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{channel, Receiver, Sender},
+    },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
-use tracing::info;
-use transcribe::Transcriber;
-use tray::{Tray, TRAY_MENU_LOG, TRAY_MENU_PAUSE, TRAY_MENU_QUIT};
+use stream::{Chunk, Chunker};
+use tracing::{error, info, warn};
+use tray::{Command, Tray, WM_TRAY};
 use windows::{
-    core::PCWSTR,
+    core::{w, PCWSTR},
     Win32::{
         Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM},
-        System::Threading::CreateMutexW,
+        System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-            PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, TranslateMessage,
-            GWLP_USERDATA, HWND_MESSAGE, MSG, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
-            WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MessageBoxW,
+            PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, MB_ICONERROR,
+            MB_ICONINFORMATION, MESSAGEBOX_STYLE, MSG, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
+            WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
         },
     },
 };
 
-const WM_TRAY: u32 = WM_APP + 1;
-const WM_HOTKEY: u32 = WM_APP + 2;
+const TICK_MS: u32 = 33;
+const REOPEN_EVERY: Duration = Duration::from_secs(2);
+/// Once key repeat has been seen, this much quiet means the key-up was lost
+/// (for example Ctrl+Alt+Del or a UAC prompt while Caps Lock was held).
+const REPEAT_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Drop leading/trailing quiet frames so chunk boundaries do not carry noise.
-fn trim_silence(samples: &[f32]) -> &[f32] {
-    const FRAME: usize = 160; // 10 ms at 16 kHz
-    const THRESHOLD: f32 = 0.006;
-    if samples.len() < FRAME * 2 {
-        return samples;
-    }
-    let rms = |part: &[f32]| (part.iter().map(|x| x * x).sum::<f32>() / part.len() as f32).sqrt();
-    let mut start = 0;
-    while start + FRAME <= samples.len() && rms(&samples[start..start + FRAME]) < THRESHOLD {
-        start += FRAME;
-    }
-    let mut end = samples.len();
-    while end >= start + FRAME * 2 && rms(&samples[end - FRAME..end]) < THRESHOLD {
-        end -= FRAME;
-    }
-    if end > start {
-        &samples[start..end]
-    } else {
-        samples
-    }
+/// Audio for the model thread.
+struct Job {
+    take: u64,
+    audio: Vec<f32>,
+    continues: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum State {
-    Loading,
-    Ready,
-    Recording,
-    Transcribing,
-    Paused,
-    Error,
-}
-
-enum WorkerEvent {
-    Ready,
-    Transcript {
-        generation: u64,
+/// News from the model and input threads.
+enum Event {
+    ModelReady,
+    ModelFailed(String),
+    Text {
+        take: u64,
+        continues: bool,
         result: Result<String, String>,
     },
+    InputFailed(String),
 }
 
-struct TranscribeJob {
-    generation: u64,
-    audio: Vec<f32>,
+/// One Caps Lock hold, from key down until its text is delivered.
+struct Take {
+    id: u64,
+    started: Instant,
+    chunker: Chunker,
+    parts: Vec<(String, bool)>,
+    pending: usize,
+    failed: bool,
+}
+
+#[derive(PartialEq)]
+enum Model {
+    Loading,
+    Ready,
+    Failed,
 }
 
 struct App {
     config: Config,
-    recorder: Arc<Recorder>,
-    hud: Arc<Hud>,
+    recorder: Recorder,
+    hud: Option<Hud>,
     tray: Tray,
-    paused: Arc<AtomicBool>,
-    jobs: Sender<TranscribeJob>,
-    results: Receiver<WorkerEvent>,
-    state: State,
-    started_at: Instant,
-    model_ready: bool,
-    generation: u64,
-    pending: usize,
-    released: bool,
-    partials: Vec<String>,
-    chunk: Vec<f32>,
-    cursor: usize,
-    heard_speech: bool,
-    silence_at: Option<Instant>,
+    jobs: Sender<Job>,
+    input: Sender<String>,
+    events: Receiver<Event>,
+    model: Model,
+    paused: bool,
+    key_held: bool,
+    active: Option<Take>,
+    finishing: VecDeque<Take>,
+    next_take: u64,
+    last_reopen: Instant,
+    mic_warned: bool,
+    /// Last Caps Lock event while held, and whether key repeat is active.
+    last_key: Instant,
+    repeating: bool,
 }
 
 impl App {
-    fn set_state(&mut self, state: State, detail: &str) {
-        self.state = state;
-        let status = match state {
-            State::Loading => "Loading English model...".to_string(),
-            State::Ready => "Ready - hold Caps Lock to dictate".to_string(),
-            State::Recording => "Listening...".to_string(),
-            State::Transcribing => "Transcribing...".to_string(),
-            State::Paused => "Paused - Caps Lock works normally".to_string(),
-            State::Error => detail.to_string(),
+    fn key(&mut self, down: bool) {
+        // Holding a key repeats key-down; only the first one counts.
+        if down && self.key_held {
+            self.repeating = true;
+            self.last_key = Instant::now();
+            return;
+        }
+        if down == self.key_held {
+            return;
+        }
+        self.key_held = down;
+        self.repeating = false;
+        self.last_key = Instant::now();
+        if down {
+            self.start_take();
+        } else {
+            self.end_take();
+        }
+    }
+
+    fn start_take(&mut self) {
+        if self.paused || self.active.is_some() {
+            return;
+        }
+        if self.model == Model::Failed {
+            self.flash("MODEL ERROR");
+            return;
+        }
+        if self.recorder.is_lost() {
+            self.flash("NO MICROPHONE");
+            return;
+        }
+        self.recorder.start();
+        self.next_take += 1;
+        self.active = Some(Take {
+            id: self.next_take,
+            started: Instant::now(),
+            chunker: Chunker::new(self.config.chunk_seconds, self.config.silence_ms),
+            parts: Vec::new(),
+            pending: 0,
+            failed: false,
+        });
+        self.refresh();
+    }
+
+    fn end_take(&mut self) {
+        let Some(mut take) = self.active.take() else {
+            return;
         };
-        self.tray
-            .set_status(&status, self.paused.load(Ordering::Acquire));
-        match state {
-            State::Recording => self.hud.set_mode(HudMode::Recording, ""),
-            State::Transcribing => self.hud.set_mode(HudMode::Transcribing, ""),
-            State::Error => self.hud.set_mode(HudMode::Error, detail),
-            State::Loading | State::Ready | State::Paused => self.hud.hide(),
-        }
-    }
-
-    fn caps_down(&mut self) {
-        if self.paused.load(Ordering::Acquire) || self.recorder.is_active() {
+        let tail = self.recorder.stop();
+        let held = take.started.elapsed();
+        info!("take {} recorded {:.2}s", take.id, held.as_secs_f32());
+        if held < Duration::from_millis(self.config.min_hold_ms) {
+            self.refresh();
             return;
         }
-        self.reset_take();
-        self.recorder.start_take();
-        self.started_at = Instant::now();
-        self.set_state(State::Recording, "");
-        info!("recording started");
-    }
-
-    fn reset_take(&mut self) {
-        self.generation += 1;
-        self.pending = 0;
-        self.released = false;
-        self.partials.clear();
-        self.chunk.clear();
-        self.cursor = 0;
-        self.heard_speech = false;
-        self.silence_at = None;
-    }
-
-    fn flush_chunk(&mut self) {
-        let audio = trim_silence(&self.chunk).to_vec();
-        self.chunk.clear();
-        self.silence_at = None;
-        if audio.len() < 1600 {
-            return;
+        let mut chunks = Vec::new();
+        take.chunker.push(&tail, &mut chunks);
+        chunks.extend(take.chunker.finish());
+        for chunk in chunks {
+            self.send(&mut take, chunk);
         }
-        let job = TranscribeJob {
-            generation: self.generation,
-            audio,
+        self.finishing.push_back(take);
+        self.deliver_ready();
+        self.refresh();
+    }
+
+    fn send(&self, take: &mut Take, chunk: Chunk) {
+        let job = Job {
+            take: take.id,
+            audio: chunk.audio,
+            continues: chunk.continues,
         };
         if self.jobs.send(job).is_ok() {
-            self.pending += 1;
-        }
-    }
-
-    /// Transcribe complete phrases while the key is still held, so release
-    /// only has to finish the short tail.
-    fn tick_streaming(&mut self) {
-        if !self.recorder.is_active() || !self.model_ready {
-            return;
-        }
-        let new_samples = self.recorder.new_chunk(&mut self.cursor);
-        self.chunk.extend_from_slice(&new_samples);
-
-        let level = self.recorder.level();
-        if level > 0.012 {
-            self.heard_speech = true;
-            self.silence_at = None;
-        } else if self.heard_speech && self.silence_at.is_none() {
-            self.silence_at = Some(Instant::now());
-        }
-
-        let quiet_long_enough = self
-            .silence_at
-            .map(|at| at.elapsed().as_millis() >= self.config.silence_ms as u128)
-            .unwrap_or(false);
-        let min_ok =
-            self.chunk.len() >= (self.config.min_chunk_seconds * 16_000.0) as usize;
-        let max_reached =
-            self.chunk.len() >= (self.config.chunk_seconds * 16_000.0) as usize;
-        if (quiet_long_enough && min_ok) || max_reached {
-            self.flush_chunk();
-        }
-    }
-
-    fn caps_up(&mut self) {
-        if !self.recorder.is_active() {
-            return;
-        }
-        let tail = self.recorder.stop_take_from(self.cursor);
-        self.chunk.extend_from_slice(&tail);
-        let held = self.started_at.elapsed();
-        info!("recording stopped: {:.2}s", held.as_secs_f32());
-        if held.as_millis() < self.config.min_hold_ms as u128 || self.chunk.len() < 1600 {
-            self.reset_take();
-            self.set_state(
-                if self.model_ready {
-                    State::Ready
-                } else {
-                    State::Loading
-                },
-                "",
-            );
-            return;
-        }
-        self.flush_chunk();
-        self.released = true;
-        if self.pending == 0 {
-            self.finish_take();
+            take.pending += 1;
         } else {
-            self.set_state(State::Transcribing, "");
+            take.failed = true;
         }
     }
 
-    fn finish_take(&mut self) {
-        let joined = crate::cleanup::clean_transcript(&self.partials.join(" "));
-        self.reset_take();
-        if joined.trim().is_empty() {
-            self.set_state(State::Error, "NO SPEECH");
-            return;
+    fn tick(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.handle(event);
         }
-        if self.config.inject != "none" {
-            if let Err(err) = inject::insert_text(
-                &joined,
-                &self.config.inject,
-                self.config.char_delay_ms,
-                self.config.paste_delay_ms,
-                self.config.append_space,
-            ) {
-                tracing::error!("could not insert transcript: {err}");
-                self.set_state(State::Error, "INPUT BLOCKED");
-                return;
+        if self.recorder.is_lost() && self.last_reopen.elapsed() >= REOPEN_EVERY {
+            self.last_reopen = Instant::now();
+            if self.active.is_some() {
+                // Keep what was said before the microphone dropped out.
+                self.end_take();
+                self.flash("NO MICROPHONE");
+            }
+            match self.recorder.reopen() {
+                Ok(()) => {
+                    info!("microphone open again");
+                    self.mic_warned = false;
+                }
+                Err(err) if !self.mic_warned => {
+                    warn!("microphone unavailable, retrying: {err:#}");
+                    self.mic_warned = true;
+                }
+                Err(_) => {}
+            }
+            self.refresh();
+        }
+        if self.key_held && self.repeating && self.last_key.elapsed() > REPEAT_TIMEOUT {
+            warn!("Caps Lock release was not seen; ending the take");
+            self.key(false);
+        }
+        if let Some(mut take) = self.active.take() {
+            let mut chunks = Vec::new();
+            take.chunker.push(&self.recorder.drain(), &mut chunks);
+            for chunk in chunks {
+                self.send(&mut take, chunk);
+            }
+            self.active = Some(take);
+            if self.recorder.is_full() {
+                info!("max_record_seconds reached");
+                self.end_take();
             }
         }
-        self.set_state(State::Ready, "");
     }
 
-    fn poll_results(&mut self) {
-        while let Ok(event) = self.results.try_recv() {
-            match event {
-                WorkerEvent::Ready => {
-                    self.model_ready = true;
-                    if self.state == State::Loading {
-                        self.set_state(State::Ready, "");
-                    }
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::ModelReady => {
+                info!("model ready");
+                self.model = Model::Ready;
+            }
+            Event::ModelFailed(err) => {
+                error!("model failed to load: {err}");
+                self.model = Model::Failed;
+                if self.active.take().is_some() {
+                    self.recorder.stop();
                 }
-                WorkerEvent::Transcript { generation, .. } if generation != self.generation => {
-                    // Stale result from a previous take; ignore it.
-                    continue;
-                }
-                WorkerEvent::Transcript { result, .. } => {
-                    self.pending = self.pending.saturating_sub(1);
+                self.finishing.clear();
+                self.flash("MODEL ERROR");
+            }
+            Event::Text {
+                take,
+                continues,
+                result,
+            } => {
+                let target = self
+                    .active
+                    .iter_mut()
+                    .chain(self.finishing.iter_mut())
+                    .find(|t| t.id == take);
+                if let Some(target) = target {
+                    target.pending -= 1;
                     match result {
-                        Ok(text) => {
-                            if !text.trim().is_empty() {
-                                self.partials.push(text);
-                            }
-                        }
+                        Ok(text) => target.parts.push((text, continues)),
                         Err(err) => {
-                            tracing::error!("transcription failed: {err}");
-                            self.reset_take();
-                            self.set_state(State::Error, "TRANSCRIPTION ERROR");
-                            return;
+                            error!("transcription failed: {err}");
+                            target.failed = true;
                         }
-                    }
-                    if self.released && self.pending == 0 {
-                        self.finish_take();
                     }
                 }
+                self.deliver_ready();
+            }
+            Event::InputFailed(err) => {
+                error!("could not insert text: {err}");
+                self.flash("INPUT BLOCKED");
+            }
+        }
+        self.refresh();
+    }
+
+    /// Hand finished takes to the input thread, oldest first.
+    fn deliver_ready(&mut self) {
+        if MENU_OPEN.load(Ordering::Relaxed) {
+            return;
+        }
+        while self.finishing.front().is_some_and(|take| take.pending == 0) {
+            let take = self.finishing.pop_front().unwrap();
+            if take.failed {
+                self.flash("TRANSCRIPTION ERROR");
+                continue;
+            }
+            let joined = stream::join(&take.parts);
+            let text = if self.config.cleanup {
+                cleanup::clean_transcript(&joined)
+            } else {
+                joined
+            };
+            info!(
+                "take {} done: {} chunk(s), {} characters",
+                take.id,
+                take.parts.len(),
+                text.chars().count()
+            );
+            if text.is_empty() {
+                self.flash("NO SPEECH");
+            } else if self.config.inject != "none" {
+                let _ = self.input.send(text);
             }
         }
     }
 
-    fn toggle_pause(&mut self) {
-        let now_paused = !self.paused.load(Ordering::Acquire);
-        self.paused.store(now_paused, Ordering::Release);
-        if now_paused {
-            self.recorder.cancel();
-            self.reset_take();
-            self.set_state(State::Paused, "");
-        } else {
-            self.set_state(
-                if self.model_ready {
-                    State::Ready
-                } else {
-                    State::Loading
-                },
-                "",
-            );
+    fn flash(&self, message: &str) {
+        if let Some(hud) = &self.hud {
+            hud.error(message);
         }
     }
 
-    fn shutdown(&mut self) {
-        self.recorder.cancel();
-        self.recorder.close();
-        self.hud.hide();
-        self.tray.remove();
+    fn refresh(&mut self) {
+        let status = if self.model == Model::Failed {
+            "Model failed to load - see the log"
+        } else if self.paused {
+            "Paused - Caps Lock works normally"
+        } else if self.recorder.is_lost() {
+            "No microphone - retrying"
+        } else if self.active.is_some() {
+            "Listening"
+        } else if !self.finishing.is_empty() {
+            "Transcribing"
+        } else if self.model == Model::Loading {
+            "Loading the speech model"
+        } else {
+            "Ready - hold Caps Lock to dictate"
+        };
+        self.tray.set_status(status, self.paused);
+        if let Some(hud) = &self.hud {
+            if self.active.is_some() {
+                hud.listening();
+            } else if !self.finishing.is_empty() {
+                hud.transcribing();
+            } else {
+                hud.idle();
+            }
+        }
+    }
+
+    fn command(&mut self, command: Command) {
+        match command {
+            Command::TogglePause => {
+                self.paused = !self.paused;
+                hook::set_paused(self.paused);
+                if self.paused {
+                    if self.active.take().is_some() {
+                        self.recorder.stop();
+                    }
+                    self.key_held = false;
+                } else {
+                    hook::release_caps_lock();
+                }
+                info!("paused: {}", self.paused);
+                self.refresh();
+            }
+            Command::OpenLog => {
+                let _ = std::process::Command::new("explorer")
+                    .arg(config::log_dir())
+                    .spawn();
+            }
+            Command::Quit => unsafe { PostQuitMessage(0) },
+        }
     }
 }
 
-unsafe extern "system" fn wnd_proc(
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+}
+
+/// Run `f` on the app unless it is already in use further up the stack.
+fn with_app<T>(f: impl FnOnce(&mut App) -> T) -> Option<T> {
+    APP.with(|cell| cell.try_borrow_mut().ok()?.as_mut().map(f))
+}
+
+static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
-    w_param: WPARAM,
-    l_param: LPARAM,
+    wparam: WPARAM,
+    lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_HOTKEY {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-        if !ptr.is_null() {
-            let app = &mut *ptr;
-            if w_param.0 == 1 {
-                app.caps_down();
-            } else {
-                app.caps_up();
-            }
+    match message {
+        WM_TIMER => {
+            with_app(App::tick);
         }
-        return LRESULT(0);
-    }
-    if message == WM_TRAY {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-        if !ptr.is_null() {
-            let msg = l_param.0 as u32 & 0xffff;
-            if msg == WM_RBUTTONUP || msg == WM_LBUTTONUP {
-                (&mut *ptr).tray.show_menu();
-            }
+        WM_CAPSLOCK => {
+            with_app(|app| app.key(wparam.0 == 1));
         }
-        return LRESULT(0);
-    }
-    if message == WM_COMMAND {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-        if !ptr.is_null() {
-            let app = &mut *ptr;
-            match w_param.0 as u32 & 0xffff {
-                id if id == TRAY_MENU_PAUSE as u32 => app.toggle_pause(),
-                id if id == TRAY_MENU_LOG as u32 => {
-                    let _ = Command::new("explorer").arg(config::log_dir()).spawn();
+        WM_TRAY => {
+            let mouse = (lparam.0 & 0xffff) as u32;
+            if mouse == WM_LBUTTONUP || mouse == WM_RBUTTONUP {
+                // The menu runs its own message loop, so keep the app free
+                // while it is open: Caps Lock and the timer keep working.
+                let state = with_app(|app| {
+                    let (status, paused) = app.tray.status();
+                    (status.to_string(), paused)
+                });
+                if let Some((status, paused)) = state {
+                    // FastTTS owns the foreground while the menu is open, so
+                    // a paste now would land nowhere; hold finished text.
+                    MENU_OPEN.store(true, Ordering::Relaxed);
+                    let command = Tray::menu(hwnd, &status, paused);
+                    MENU_OPEN.store(false, Ordering::Relaxed);
+                    with_app(|app| {
+                        if let Some(command) = command {
+                            app.command(command);
+                        }
+                        app.deliver_ready();
+                        app.refresh();
+                    });
                 }
-                id if id == TRAY_MENU_QUIT as u32 => {
-                    app.shutdown();
-                    PostQuitMessage(0);
-                }
-                _ => {}
             }
         }
-        return LRESULT(0);
-    }
-    if message == WM_TIMER {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-        if !ptr.is_null() {
-            let app = &mut *ptr;
-            app.poll_results();
-            app.tick_streaming();
-            if app.recorder.is_active() {
-                app.hud.push_level(app.recorder.level());
-            }
+        _ if Some(&message) == TASKBAR_CREATED.get() => {
+            // Explorer restarted; put the icon back.
+            with_app(|app| app.tray.restore());
         }
-        return LRESULT(0);
+        _ => return DefWindowProcW(hwnd, message, wparam, lparam),
     }
-    if message == WM_DESTROY {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-        if !ptr.is_null() {
-            let app = &mut *ptr;
-            app.shutdown();
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            drop(Box::from_raw(ptr));
-        }
-        PostQuitMessage(0);
-        return LRESULT(0);
-    }
-    DefWindowProcW(hwnd, message, w_param, l_param)
+    LRESULT(0)
 }
 
 fn create_window() -> Result<HWND> {
-    let class_name: Vec<u16> = "FastTTSHiddenWindow\0".encode_utf16().collect();
-    let instance = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None)? };
-    let mut class: WNDCLASSEXW = unsafe { std::mem::zeroed() };
-    class.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-    class.style = windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0);
-    class.lpfnWndProc = Some(wnd_proc);
-    class.hInstance = instance.into();
-    class.lpszClassName = windows::core::PCWSTR(class_name.as_ptr());
-    let atom = unsafe { RegisterClassExW(&class) };
-    if atom == 0 {
-        let error = unsafe { GetLastError() };
-        if error != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
-            return Err(anyhow!("could not register window class: {error:?}"));
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let class = w!("FastTTS");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return Err(anyhow!("could not register the window class"));
         }
-    }
-    let hwnd = unsafe {
-        CreateWindowExW(
-            Default::default(),
-            windows::core::PCWSTR(class_name.as_ptr()),
-            PCWSTR::null(),
-            Default::default(),
+        TASKBAR_CREATED.get_or_init(|| RegisterWindowMessageW(w!("TaskbarCreated")));
+        // A hidden top-level window: unlike a message-only window it also
+        // hears the TaskbarCreated broadcast.
+        Ok(CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class,
+            class,
+            WS_OVERLAPPED,
             0,
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             Some(instance.into()),
             None,
-        )?
-    };
-    Ok(hwnd)
+        )?)
+    }
 }
 
 fn setup_logging() {
-    let dir = config::log_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let appender = tracing_appender::rolling::daily(dir, "fasttts.log");
-    tracing_subscriber::fmt()
-        .with_writer(appender)
-        .with_ansi(false)
-        .init();
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("fasttts")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(config::log_dir());
+    if let Ok(appender) = appender {
+        tracing_subscriber::fmt()
+            .with_writer(appender)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .init();
+    }
+    std::panic::set_hook(Box::new(|panic| error!("crashed: {panic}")));
 }
 
-fn single_instance() -> bool {
-    unsafe {
-        let name: Vec<u16> = "Local\\FastTTS-rust-single-instance\0"
-            .encode_utf16()
-            .collect();
-        let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
-        match handle {
-            Ok(handle) => {
-                let _ = handle;
-                !matches!(GetLastError(), ERROR_ALREADY_EXISTS)
+/// False when another FastTTS is already running.
+fn first_instance() -> bool {
+    // The handle is deliberately kept open for the life of the process.
+    let mutex = unsafe { CreateMutexW(None, false, w!("Local\\FastTTS")) };
+    !(mutex.is_ok() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS)
+}
+
+fn spawn_workers(
+    config: &Config,
+    jobs: Receiver<Job>,
+    input: Receiver<String>,
+) -> Result<Receiver<Event>> {
+    let (events, received) = channel();
+    let model_events = events.clone();
+    thread::Builder::new()
+        .name("fasttts-model".into())
+        .spawn(move || {
+            let mut model = match transcribe::Transcriber::load() {
+                Ok(model) => model,
+                Err(err) => {
+                    let _ = model_events.send(Event::ModelFailed(format!("{err:#}")));
+                    return;
+                }
+            };
+            let _ = model_events.send(Event::ModelReady);
+            for job in jobs {
+                let result = model
+                    .transcribe(&job.audio)
+                    .map_err(|err| format!("{err:#}"));
+                let event = Event::Text {
+                    take: job.take,
+                    continues: job.continues,
+                    result,
+                };
+                if model_events.send(event).is_err() {
+                    break;
+                }
             }
-            Err(_) => false,
-        }
-    }
+        })?;
+    let config = config.clone();
+    thread::Builder::new()
+        .name("fasttts-input".into())
+        .spawn(move || {
+            for text in input {
+                let inserted = inject::insert(
+                    &text,
+                    &config.inject,
+                    config.char_delay_ms,
+                    config.paste_delay_ms,
+                    config.append_space,
+                );
+                if let Err(err) = inserted {
+                    if events.send(Event::InputFailed(format!("{err:#}"))).is_err() {
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(received)
 }
 
 fn run() -> Result<()> {
-    setup_logging();
-    info!("FastTTS starting");
-    if !single_instance() {
-        return Err(anyhow!("FastTTS is already running"));
-    }
     let config = Config::load()?;
-    let root = config::project_root();
-    let model = config.model_path();
-    anyhow::ensure!(
-        model.is_file(),
-        "the bundled English model is missing: {}",
-        model.display()
-    );
-
     let hwnd = create_window()?;
-    let recorder = Arc::new(Recorder::new(config.max_record_seconds));
-    if config.hot_mic {
-        recorder.open(&config.mic_device)?;
-    }
-    let hud = Arc::new(Hud::new(&root)?);
-    let tray = Tray::new(hwnd, &root.join("assets/fasttts.ico"))?;
-    let paused = Arc::new(AtomicBool::new(false));
-    let _hook = HotkeyHook::start(hwnd, paused.clone())?;
+    let recorder = Recorder::new(&config.mic_device, config.max_record_seconds);
+    let hud = if config.hud {
+        Hud::new(recorder.meter())
+            .inspect_err(|err| warn!("running without the HUD: {err:#}"))
+            .ok()
+    } else {
+        None
+    };
+    let tray = Tray::new(hwnd)?;
+    let (jobs, job_queue) = channel();
+    let (input, input_queue) = channel();
+    let events = spawn_workers(&config, job_queue, input_queue)?;
+    let _hook = HotkeyHook::start(hwnd)?;
+    hook::release_caps_lock();
 
-    let (job_tx, job_rx) = bounded::<TranscribeJob>(16);
-    let (result_tx, result_rx) = bounded::<WorkerEvent>(8);
-    let (model_tx, model_rx) = bounded::<Result<Transcriber, String>>(1);
-
-    let model_path = model.clone();
-    let threads = config.threads;
-    let prompt = config.initial_prompt.clone();
-    let cleanup = config.cleanup;
-    thread::spawn(move || {
-        let outcome = Transcriber::new(&model_path, threads, &prompt, cleanup)
-            .map_err(|err| err.to_string());
-        let _ = model_tx.send(outcome);
-    });
-
-    let result_worker = result_tx.clone();
-    thread::spawn(move || {
-        let mut transcriber = match model_rx.recv() {
-            Ok(Ok(transcriber)) => transcriber,
-            Ok(Err(err)) => {
-                let _ = result_worker.send(WorkerEvent::Transcript {
-                    generation: 0,
-                    result: Err(err),
-                });
-                return;
-            }
-            Err(_) => return,
+    APP.with(|cell| {
+        let mut app = App {
+            config,
+            recorder,
+            hud,
+            tray,
+            jobs,
+            input,
+            events,
+            model: Model::Loading,
+            paused: false,
+            key_held: false,
+            active: None,
+            finishing: VecDeque::new(),
+            next_take: 0,
+            last_reopen: Instant::now(),
+            mic_warned: false,
+            last_key: Instant::now(),
+            repeating: false,
         };
-        info!("English model ready");
-        if result_worker
-            .send(WorkerEvent::Ready)
-            .is_err()
-        {
-            return;
-        }
-        for job in job_rx.iter() {
-            let result = transcriber
-                .transcribe(&job.audio)
-                .map_err(|err| err.to_string());
-            if result_worker
-                .send(WorkerEvent::Transcript {
-                    generation: job.generation,
-                    result,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
+        app.refresh();
+        *cell.borrow_mut() = Some(app);
     });
-
-    let mut app = Box::new(App {
-        config,
-        recorder,
-        hud,
-        tray,
-        paused,
-        jobs: job_tx,
-        results: result_rx,
-        state: State::Loading,
-        started_at: Instant::now(),
-        model_ready: false,
-        generation: 0,
-        pending: 0,
-        released: false,
-        partials: Vec::new(),
-        chunk: Vec::new(),
-        cursor: 0,
-        heard_speech: false,
-        silence_at: None,
-    });
-    app.set_state(State::Loading, "");
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *app as *mut App) as isize) };
-    unsafe { SetTimer(Some(hwnd), 1, 33, None) };
+    unsafe { SetTimer(Some(hwnd), 1, TICK_MS, None) };
 
     let mut message = MSG::default();
-    while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+        unsafe { DispatchMessageW(&message) };
     }
-    // The window's WM_DESTROY handler already freed App.
+    info!("FastTTS quitting");
+    APP.with(|cell| cell.borrow_mut().take());
     Ok(())
 }
 
-fn main() {
-    if let Err(err) = run() {
-        tracing::error!("FastTTS could not start: {err:#}");
-        let text = format!("FastTTS could not start:\n\n{err:#}");
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let caption: Vec<u16> = "FastTTS\0".encode_utf16().collect();
-        unsafe {
-            windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                None,
-                PCWSTR(wide.as_ptr()),
-                PCWSTR(caption.as_ptr()),
-                windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
-            );
-        }
-    }
+fn message_box(text: &str, style: MESSAGEBOX_STYLE) {
+    let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), w!("FastTTS"), style) };
 }
 
-#[cfg(test)]
-mod tests {
-    use super::trim_silence;
-
-    #[test]
-    fn trim_silence_keeps_the_spoken_middle() {
-        let mut samples = vec![0.0; 1600];
-        samples.extend((0..3200).map(|i| (i as f32 / 3200.0).sin() * 0.2));
-        samples.extend(vec![0.0; 1600]);
-        let trimmed = trim_silence(&samples);
-        assert!(trimmed.len() >= 3000);
-        assert!(trimmed.len() < samples.len());
+fn main() {
+    setup_logging();
+    info!("FastTTS {} starting", env!("CARGO_PKG_VERSION"));
+    if !first_instance() {
+        message_box(
+            "FastTTS is already running. Look for its icon in the tray.",
+            MB_ICONINFORMATION,
+        );
+        return;
+    }
+    if let Err(err) = run() {
+        error!("could not start: {err:#}");
+        message_box(
+            &format!("FastTTS could not start:\n\n{err:#}"),
+            MB_ICONERROR,
+        );
     }
 }

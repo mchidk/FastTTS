@@ -1,237 +1,303 @@
-//! Persistent microphone capture with a short pre-roll.
+//! Always-open microphone: downmix, resample to 16 kHz, keep a 250 ms pre-roll.
 
 use anyhow::{anyhow, Context, Result};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleFormat, Stream, StreamConfig,
+    Device, ErrorKind, FromSample, SampleFormat, SizedSample, Stream, StreamConfig,
 };
-use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
+    f64::consts::PI,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard,
     },
 };
 
-const SAMPLE_RATE: u32 = 16_000;
+/// Sample rate the speech model expects.
+pub const RATE: usize = 16_000;
+const PRE_ROLL: usize = RATE / 4;
 
+/// Loudest RMS since the HUD last looked. Every audio callback records into
+/// it and the HUD takes the value once per frame, so no peak is missed.
 #[derive(Default)]
-struct Inner {
+pub struct Meter(AtomicU32);
+
+impl Meter {
+    fn record(&self, rms: f32) {
+        // For non-negative floats the bit pattern orders like the value.
+        self.0.fetch_max(rms.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn take(&self) -> f32 {
+        f32::from_bits(self.0.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// Windowed-sinc resampler that keeps its state across callbacks, so the
+/// stream has no seams and frequencies above 8 kHz cannot alias into speech.
+struct Resampler {
+    step: f64,
+    half: usize,
+    phases: usize,
+    table: Vec<f32>,
+    history: Vec<f32>,
+    position: f64,
+}
+
+impl Resampler {
+    fn new(from: usize, to: usize) -> Self {
+        let step = from as f64 / to as f64;
+        let cutoff = 0.45 * (to as f64 / from as f64).min(1.0); // cycles per input sample
+        let half = ((8.0 / cutoff / 2.0).ceil() as usize).max(4);
+        let phases = 256;
+        let taps = 2 * half;
+        let mut table = vec![0f32; (phases + 1) * taps];
+        for phase in 0..=phases {
+            let frac = phase as f64 / phases as f64;
+            let row = &mut table[phase * taps..(phase + 1) * taps];
+            let mut sum = 0.0;
+            for (tap, weight) in row.iter_mut().enumerate() {
+                let x = tap as f64 - (half as f64 - 1.0) - frac;
+                let sinc = if x == 0.0 {
+                    2.0 * cutoff
+                } else {
+                    (2.0 * PI * cutoff * x).sin() / (PI * x)
+                };
+                let window = 0.5 + 0.5 * (PI * x / half as f64).cos();
+                *weight = (sinc * window) as f32;
+                sum += sinc * window;
+            }
+            for weight in row.iter_mut() {
+                *weight /= sum as f32;
+            }
+        }
+        Self {
+            step,
+            half,
+            phases,
+            table,
+            history: vec![0.0; half],
+            position: half as f64,
+        }
+    }
+
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        self.history.extend_from_slice(input);
+        let taps = 2 * self.half;
+        while (self.position as usize) + self.half < self.history.len() {
+            let base = self.position as usize;
+            let frac = self.position - base as f64;
+            let phase = (frac * self.phases as f64).round() as usize;
+            let row = &self.table[phase * taps..(phase + 1) * taps];
+            let start = base + 1 - self.half;
+            let window = &self.history[start..start + taps];
+            out.push(window.iter().zip(row).map(|(x, w)| x * w).sum());
+            self.position += self.step;
+        }
+        let consumed = (self.position as usize).saturating_sub(self.half);
+        self.history.drain(..consumed);
+        self.position -= consumed as f64;
+    }
+}
+
+struct Capture {
+    resampler: Option<Resampler>,
+    mono: Vec<f32>,
+    resampled: Vec<f32>,
     ring: VecDeque<f32>,
-    take: Vec<f32>,
+    pending: Vec<f32>,
+    captured: usize,
     capturing: bool,
 }
 
-/// Shared state owned by Arc so cpal callbacks can be Send + 'static.
-struct RecorderState {
-    inner: Mutex<Inner>,
-    active: AtomicBool,
-    level: AtomicU32,
-    device_rate: AtomicU32,
-    channels: AtomicU32,
+struct Shared {
+    capture: Mutex<Capture>,
+    meter: Arc<Meter>,
+    lost: AtomicBool,
     max_samples: usize,
 }
 
-impl RecorderState {
-    /// Downmix interleaved device audio to mono (mics here expose 4 channels).
-    fn mono_f32<'a>(&self, data: &'a [f32]) -> Vec<f32> {
-        let stride = self.channels.load(Ordering::Relaxed).max(1) as usize;
-        data.chunks(stride)
-            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-            .collect()
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Capture> {
+        self.capture.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    fn mono_i16(&self, data: &[i16]) -> Vec<f32> {
-        let stride = self.channels.load(Ordering::Relaxed).max(1) as usize;
-        data.chunks(stride)
-            .map(|frame| frame.iter().map(|v| *v as f32 / 32768.0).sum::<f32>() / frame.len() as f32)
-            .collect()
-    }
-
-    fn push_f32(&self, data: &[f32]) {
-        let samples = self.mono_f32(data);
-        self.store_level(&samples);
-        let pre_roll = (0.25 * self.device_rate.load(Ordering::Relaxed) as f64) as usize;
-        let mut inner = self.inner.lock();
-        for sample in samples {
-            Self::push_sample(&mut inner, sample, pre_roll);
-        }
-    }
-
-    fn push_i16(&self, data: &[i16]) {
-        let samples = self.mono_i16(data);
-        self.store_level(&samples);
-        let pre_roll = (0.25 * self.device_rate.load(Ordering::Relaxed) as f64) as usize;
-        let mut inner = self.inner.lock();
-        for sample in samples {
-            Self::push_sample(&mut inner, sample, pre_roll);
-        }
-    }
-
-    fn store_level(&self, samples: &[f32]) {
+    fn push<T>(&self, data: &[T], channels: usize)
+    where
+        T: SizedSample,
+        f32: FromSample<T>,
+    {
+        let mut guard = self.lock();
+        let capture = &mut *guard;
+        capture.mono.clear();
+        capture
+            .mono
+            .extend(data.chunks_exact(channels).map(|frame| {
+                frame.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>() / channels as f32
+            }));
+        let samples = match capture.resampler.as_mut() {
+            Some(resampler) => {
+                capture.resampled.clear();
+                resampler.process(&capture.mono, &mut capture.resampled);
+                &capture.resampled
+            }
+            None => &capture.mono,
+        };
         if samples.is_empty() {
             return;
         }
         let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
-        self.level.store(rms.to_bits(), Ordering::Relaxed);
-    }
+        self.meter.record(rms);
 
-    fn push_sample(inner: &mut Inner, sample: f32, pre_roll: usize) {
-        if pre_roll > 0 {
-            inner.ring.push_back(sample);
-            while inner.ring.len() > pre_roll {
-                inner.ring.pop_front();
-            }
-        }
-        if inner.capturing {
-            inner.take.push(sample);
+        if capture.capturing {
+            let room = self.max_samples.saturating_sub(capture.captured);
+            let keep = samples.len().min(room);
+            capture.pending.extend_from_slice(&samples[..keep]);
+            capture.captured += keep;
+        } else {
+            capture.ring.extend(samples.iter());
+            let excess = capture.ring.len().saturating_sub(PRE_ROLL);
+            capture.ring.drain(..excess);
         }
     }
 }
 
 pub struct Recorder {
-    state: Arc<RecorderState>,
-    stream: Mutex<Option<Stream>>,
+    shared: Arc<Shared>,
+    device_name: String,
+    stream: Option<Stream>,
 }
 
 impl Recorder {
-    pub fn new(max_seconds: u64) -> Self {
-        Self {
-            state: Arc::new(RecorderState {
-                inner: Mutex::new(Inner::default()),
-                active: AtomicBool::new(false),
-                level: AtomicU32::new(0),
-                device_rate: AtomicU32::new(SAMPLE_RATE),
-                channels: AtomicU32::new(1),
-                max_samples: (max_seconds as usize) * SAMPLE_RATE as usize,
+    /// Open the microphone. Failure is not fatal: the recorder reports
+    /// itself lost and the app retries.
+    pub fn new(device_name: &str, max_seconds: u64) -> Self {
+        let mut recorder = Self {
+            shared: Arc::new(Shared {
+                capture: Mutex::new(Capture {
+                    resampler: None,
+                    mono: Vec::new(),
+                    resampled: Vec::new(),
+                    ring: VecDeque::with_capacity(PRE_ROLL + 4096),
+                    pending: Vec::new(),
+                    captured: 0,
+                    capturing: false,
+                }),
+                meter: Arc::new(Meter::default()),
+                lost: AtomicBool::new(true),
+                max_samples: max_seconds as usize * RATE,
             }),
-            stream: Mutex::new(None),
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.state.active.load(Ordering::Acquire)
-    }
-
-    pub fn level(&self) -> f32 {
-        f32::from_bits(self.state.level.load(Ordering::Relaxed))
-    }
-
-    pub fn open(&self, device_name: &str) -> Result<()> {
-        let host = cpal::default_host();
-        let device = select_device(&host, device_name)?;
-        let (config, format) = select_config(&device)?;
-        let state = Arc::clone(&self.state);
-
-        let rate = config.sample_rate;
-        let channels = config.channels as u32;
-        let mut stream_config: StreamConfig = config;
-        stream_config.buffer_size = cpal::BufferSize::Fixed(1024);
-        self.state.device_rate.store(rate, Ordering::Relaxed);
-        self.state.channels.store(channels, Ordering::Relaxed);
-        let stream = match format {
-            SampleFormat::F32 => device
-                .build_input_stream(
-                    stream_config.clone(),
-                    move |data: &[f32], _| state.push_f32(data),
-                    |err| tracing::warn!("microphone callback error: {err}"),
-                    None,
-                )
-                .context("could not build the input stream")?,
-            SampleFormat::I16 => device
-                .build_input_stream(
-                    stream_config.clone(),
-                    move |data: &[i16], _| state.push_i16(data),
-                    |err| tracing::warn!("microphone callback error: {err}"),
-                    None,
-                )
-                .context("could not build the input stream")?,
-            other => return Err(anyhow!("unsupported microphone sample format: {other:?}")),
+            device_name: device_name.to_string(),
+            stream: None,
         };
-        stream.play().context("could not start the input stream")?;
-        *self.stream.lock() = Some(stream);
-        tracing::info!("microphone stream open at {} Hz", config.sample_rate);
+        if let Err(err) = recorder.reopen() {
+            tracing::warn!("microphone unavailable: {err:#}");
+        }
+        recorder
+    }
+
+    /// (Re)build the input stream, for start-up and after the device vanished.
+    pub fn reopen(&mut self) -> Result<()> {
+        self.stream = None;
+        self.shared.lost.store(true, Ordering::Release);
+        let device = select_device(&self.device_name)?;
+        let supported = device
+            .default_input_config()
+            .context("could not read the microphone format")?;
+        let format = supported.sample_format();
+        let config: StreamConfig = supported.into();
+        let rate = config.sample_rate as usize;
+        let channels = config.channels as usize;
+        anyhow::ensure!(
+            channels > 0 && rate > 0,
+            "the microphone reports no audio format"
+        );
+        {
+            let mut capture = self.shared.lock();
+            capture.resampler = (rate != RATE).then(|| Resampler::new(rate, RATE));
+            capture.ring.clear();
+        }
+        let stream = match format {
+            SampleFormat::F32 => build::<f32>(&device, &config, &self.shared),
+            SampleFormat::I16 => build::<i16>(&device, &config, &self.shared),
+            SampleFormat::I32 => build::<i32>(&device, &config, &self.shared),
+            SampleFormat::U16 => build::<u16>(&device, &config, &self.shared),
+            other => Err(anyhow!("unsupported microphone sample format {other:?}")),
+        }?;
+        stream.play().context("could not start the microphone")?;
+        self.shared.lost.store(false, Ordering::Release);
+        self.stream = Some(stream);
+        tracing::info!("microphone open: {format:?}, {rate} Hz, {channels} channel(s)");
         Ok(())
     }
 
-    pub fn close(&self) {
-        if let Some(stream) = self.stream.lock().take() {
-            let _ = stream.pause();
-        }
+    /// True after the device disappeared; the app then calls `reopen`.
+    pub fn is_lost(&self) -> bool {
+        self.shared.lost.load(Ordering::Acquire)
     }
 
-    pub fn start_take(&self) {
-        let mut inner = self.state.inner.lock();
-        inner.take = inner.ring.iter().copied().collect();
-        inner.ring.clear();
-        inner.capturing = true;
-        self.state.active.store(true, Ordering::Release);
+    pub fn meter(&self) -> Arc<Meter> {
+        Arc::clone(&self.shared.meter)
     }
 
-    /// Return the samples captured since `cursor` (in device-rate samples),
-    /// resampled to 16 kHz, and advance the cursor. Used for streaming chunks.
-    pub fn new_chunk(&self, cursor: &mut usize) -> Vec<f32> {
-        let inner = self.state.inner.lock();
-        if *cursor > inner.take.len() {
-            *cursor = inner.take.len();
-        }
-        let pending = &inner.take[*cursor..];
-        *cursor = inner.take.len();
-        self.convert(pending)
+    /// Start a take that begins with the pre-roll.
+    pub fn start(&self) {
+        let mut capture = self.shared.lock();
+        let pre_roll: Vec<f32> = capture.ring.drain(..).collect();
+        capture.captured = pre_roll.len();
+        capture.pending = pre_roll;
+        capture.capturing = true;
     }
 
-    /// Stop the take and return only the tail since `cursor`, resampled.
-    pub fn stop_take_from(&self, from: usize) -> Vec<f32> {
-        let mut inner = self.state.inner.lock();
-        inner.capturing = false;
-        self.state.active.store(false, Ordering::Release);
-        let mut samples = std::mem::take(&mut inner.take);
-        let start = from.min(samples.len());
-        let tail = samples.split_off(start);
-        self.convert(&tail)
+    /// Samples captured since the last call.
+    pub fn drain(&self) -> Vec<f32> {
+        std::mem::take(&mut self.shared.lock().pending)
     }
 
-    fn convert(&self, samples: &[f32]) -> Vec<f32> {
-        let rate = self.state.device_rate.load(Ordering::Relaxed);
-        let converted = if rate != SAMPLE_RATE && samples.len() >= 2 {
-            resample(samples, rate, SAMPLE_RATE)
-        } else {
-            samples.to_vec()
-        };
-        converted.into_iter().take(self.state.max_samples).collect()
+    /// End the take and return its last samples.
+    pub fn stop(&self) -> Vec<f32> {
+        let mut capture = self.shared.lock();
+        capture.capturing = false;
+        std::mem::take(&mut capture.pending)
     }
 
-    pub fn cancel(&self) {
-        let mut inner = self.state.inner.lock();
-        inner.capturing = false;
-        inner.take.clear();
-        self.state.active.store(false, Ordering::Release);
+    pub fn is_full(&self) -> bool {
+        let capture = self.shared.lock();
+        capture.capturing && capture.captured >= self.shared.max_samples
     }
 }
 
-fn resample(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
-    if from == to || samples.len() < 2 {
-        return samples.to_vec();
-    }
-    let ratio = from as f64 / to as f64;
-    let count = (samples.len() as f64 / ratio) as usize;
-    (0..count)
-        .map(|index| {
-            let position = index as f64 * ratio;
-            let base = position as usize;
-            let fraction = (position - base as f64) as f32;
-            let a = samples[base];
-            let b = samples.get(base + 1).copied().unwrap_or(a);
-            a + (b - a) * fraction
-        })
-        .collect()
+fn build<T>(device: &Device, config: &StreamConfig, shared: &Arc<Shared>) -> Result<Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let channels = config.channels as usize;
+    let data = Arc::clone(shared);
+    let errors = Arc::clone(shared);
+    device
+        .build_input_stream(
+            *config,
+            move |samples: &[T], _| data.push(samples, channels),
+            move |err| match err.kind() {
+                ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated => {
+                    tracing::warn!("microphone lost: {err}");
+                    errors.lost.store(true, Ordering::Release);
+                }
+                _ => tracing::debug!("microphone: {err}"),
+            },
+            None,
+        )
+        .context("could not open the microphone stream")
 }
 
-fn select_device(host: &cpal::Host, name: &str) -> Result<Device> {    if name.is_empty() {
+fn select_device(name: &str) -> Result<Device> {
+    let host = cpal::default_host();
+    if name.is_empty() {
         return host
             .default_input_device()
-            .ok_or_else(|| anyhow!("no default microphone found"));
+            .ok_or_else(|| anyhow!("no microphone found"));
     }
     host.input_devices()?
         .find(|device| {
@@ -243,64 +309,93 @@ fn select_device(host: &cpal::Host, name: &str) -> Result<Device> {    if name.i
         .ok_or_else(|| anyhow!("microphone '{name}' was not found"))
 }
 
-fn select_config(device: &Device) -> Result<(StreamConfig, SampleFormat)> {
-    let mut chosen: Option<cpal::SupportedStreamConfig> = None;
-    for range in device.supported_input_configs()? {
-        if range.min_sample_rate() <= SAMPLE_RATE && range.max_sample_rate() >= SAMPLE_RATE {
-            let mono = range.channels() == 1;
-            let format = range.sample_format();
-            let better = match &chosen {
-                None => true,
-                Some(current) => {
-                    (mono && current.channels() != 1)
-                        || (mono == (current.channels() == 1)
-                            && format == SampleFormat::F32
-                            && current.sample_format() != SampleFormat::F32)
-                }
-            };
-            if better {
-                chosen = Some(range.with_sample_rate(SAMPLE_RATE));
-            }
-            if mono && format == SampleFormat::F32 {
-                break;
-            }
-        }
-    }
-    let config = match chosen {
-        Some(config) => config,
-        None => device
-            .default_input_config()
-            .context("could not read the microphone configuration")?,
-    };
-    let format = config.sample_format();
-    tracing::info!(
-        "microphone format {format:?} at {} Hz, {} channel(s)",
-        config.sample_rate(),
-        config.channels()
-    );
-    Ok((config.into(), format))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{resample, Recorder};
+    use super::*;
 
-    #[test]
-    fn downmixes_interleaved_stereo() {
-        let recorder = Recorder::new(1);
-        recorder.state.channels.store(2, std::sync::atomic::Ordering::Relaxed);
-        let interleaved = [1.0f32, -1.0, 0.5, 0.5, 0.0, 0.8];
-        let mono = recorder.state.mono_f32(&interleaved);
-        assert_eq!(mono, vec![0.0, 0.5, 0.4]);
+    fn sine(freq: f64, rate: usize, seconds: f64) -> Vec<f32> {
+        (0..(rate as f64 * seconds) as usize)
+            .map(|i| (2.0 * PI * freq * i as f64 / rate as f64).sin() as f32 * 0.5)
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    fn resample_in_pieces(input: &[f32], from: usize, piece: usize) -> Vec<f32> {
+        let mut resampler = Resampler::new(from, RATE);
+        let mut out = Vec::new();
+        for part in input.chunks(piece) {
+            resampler.process(part, &mut out);
+        }
+        out
     }
 
     #[test]
-    fn resamples_48k_to_16k() {
-        let source: Vec<f32> = (0..4800).map(|i| i as f32 / 4800.0).collect();
-        let output = resample(&source, 48_000, 16_000);
-        assert_eq!(output.len(), 1600);
-        assert!((output[0] - 0.0).abs() < 0.001);
-        assert!((output[800] - 0.5).abs() < 0.01);
-        assert!((output[1599] - source[4797]).abs() < 0.01);
+    fn resampling_keeps_length_and_speech_band() {
+        for from in [48_000, 44_100, 32_000] {
+            let input = sine(1_000.0, from, 1.0);
+            let out = resample_in_pieces(&input, from, 441);
+            let expected = RATE as i64;
+            assert!(
+                (out.len() as i64 - expected).abs() < 64,
+                "{from}: {}",
+                out.len()
+            );
+            let body = &out[200..out.len() - 200];
+            assert!((rms(body) - 0.3536).abs() < 0.01, "{from}: {}", rms(body));
+        }
+    }
+
+    #[test]
+    fn resampling_blocks_aliasing() {
+        // 12 kHz cannot be represented at 16 kHz; without filtering it would
+        // fold down to 4 kHz at full strength.
+        let input = sine(12_000.0, 48_000, 1.0);
+        let out = resample_in_pieces(&input, 48_000, 480);
+        assert!(rms(&out[200..out.len() - 200]) < 0.01);
+    }
+
+    #[test]
+    fn pieces_and_whole_give_the_same_signal() {
+        let input = sine(440.0, 48_000, 0.5);
+        let whole = resample_in_pieces(&input, 48_000, input.len());
+        let pieces = resample_in_pieces(&input, 48_000, 333);
+        assert_eq!(whole.len(), pieces.len());
+        for (a, b) in whole.iter().zip(&pieces) {
+            assert!((a - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn meter_holds_the_peak_until_read() {
+        let meter = Meter::default();
+        meter.record(0.1);
+        meter.record(0.4);
+        meter.record(0.2);
+        assert_eq!(meter.take(), 0.4);
+        assert_eq!(meter.take(), 0.0);
+    }
+
+    #[test]
+    fn capture_downmixes_and_caps_the_take() {
+        let shared = Shared {
+            capture: Mutex::new(Capture {
+                resampler: None,
+                mono: Vec::new(),
+                resampled: Vec::new(),
+                ring: VecDeque::new(),
+                pending: Vec::new(),
+                captured: 0,
+                capturing: true,
+            }),
+            meter: Arc::new(Meter::default()),
+            lost: AtomicBool::new(false),
+            max_samples: 3,
+        };
+        shared.push(&[1.0f32, 0.0, 0.5, 0.5], 2);
+        shared.push(&[0.2f32, 0.2, 1.0, 1.0], 2);
+        assert_eq!(shared.lock().pending, vec![0.5, 0.5, 0.2]);
     }
 }

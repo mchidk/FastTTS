@@ -4,29 +4,24 @@ Licensed under the MIT License (see LICENSE).
 
 FastTTS is an independent project and is not affiliated with Cactus Compute.
 
-Runtime components
-==================
+Third-party components
+======================
 
-Cactus Whistle (whistle.cact)
-  Apache-2.0. 16.9 MB speech-to-text model, bundled locally under
-  models/cactus/whistle.cact.
+Cactus Whistle speech model (models/whistle.cact, embedded in fasttts.exe)
+  Apache-2.0
   https://huggingface.co/Cactus-Compute/whistle
+  SHA-256 b6e02f048568ac5d01a2042556c658061e699acbc0aa2a1439f52f3d461dffeb
 
-cactus-rs / cactus-sys
-  MIT OR Apache-2.0. Safe Rust bindings and the prebuilt native engine.
-  https://github.com/hxphsts/cactus-rs
+Cactus Needle engine and the cactus-rs / cactus-sys bindings
+  Apache-2.0 (engine), MIT OR Apache-2.0 (bindings)
   https://github.com/cactus-compute/cactus
+  https://github.com/hxphsts/cactus-rs
 
-cpal / clipboard-win / windows-rs / image / regex / serde / toml
-  MIT, Apache-2.0 or BSD-style licenses. Standard Rust crates.
+LLVM libc++ and libunwind (statically linked)
+  Apache-2.0 WITH LLVM-exception
+  https://llvm.org
 
-Bundled runtime DLLs
-====================
+Rust crates (cpal, clipboard-win, windows, regex, serde, toml, tracing, anyhow)
+  MIT or Apache-2.0
 
-The Windows gnullvm build needs `libc++.dll` and `libunwind.dll` from LLVM
-MinGW for the Cactus engine. Both are bundled in `runtime/` and copied next
-to `fasttts.exe` by `install-shortcut.ps1`.
-
-The 16.9 MB Whistle model is bundled locally for this checkout but excluded
-from Git because model binaries are not source. No other model weights are
-committed to the Rust repository.
+tests/fixtures/speech.wav was synthesised with the Windows speech engine.

@@ -1,44 +1,27 @@
-//! Text insertion: atomic clipboard paste first, tagged Unicode SendInput second.
-
-use anyhow::{anyhow, Result};
-use clipboard_win::{formats, get_clipboard, set_clipboard};
-use std::{mem::size_of, thread, time::Duration};
-use windows::Win32::{
-    UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_V,
-    },
-};
+//! Put the transcript at the caret: clipboard paste first, typed Unicode second.
 
 use crate::hook::INJECT_TAG;
+use anyhow::{anyhow, Result};
+use clipboard_win::{formats, raw, set_clipboard, Clipboard};
+use std::{mem::size_of, thread, time::Duration};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_TAB, VK_V,
+};
 
-fn key(vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+/// Clipboard formats held as GDI handles rather than memory; Windows
+/// re-synthesises them from the memory formats we do save.
+const HANDLE_FORMATS: &[u32] = &[2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E];
+/// Do not snapshot clipboards larger than this.
+const SNAPSHOT_LIMIT: usize = 64 << 20;
+
+fn key(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(vk),
-                wScan: 0,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: INJECT_TAG,
-            },
-        },
-    }
-}
-
-fn unicode(unit: u16, up: bool) -> INPUT {
-    let flags = if up {
-        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
-    } else {
-        KEYEVENTF_UNICODE
-    };
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(0),
-                wScan: unit,
+                wVk: vk,
+                wScan: scan,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: INJECT_TAG,
@@ -48,105 +31,125 @@ fn unicode(unit: u16, up: bool) -> INPUT {
 }
 
 fn send(events: &[INPUT]) -> Result<()> {
-    if events.is_empty() {
-        return Ok(());
-    }
     let sent = unsafe { SendInput(events, size_of::<INPUT>() as i32) };
     if sent as usize != events.len() {
         return Err(anyhow!(
-            "SendInput was blocked (Windows does not let an unelevated app type into an elevated window)"
+            "Windows blocked the input (an app running as administrator cannot receive it)"
         ));
     }
     Ok(())
 }
 
-fn send_ctrl_v() -> Result<()> {
-    send(&[
-        key(VK_CONTROL.0, KEYBD_EVENT_FLAGS(0)),
-        key(VK_V.0, KEYBD_EVENT_FLAGS(0)),
-        key(VK_V.0, KEYEVENTF_KEYUP),
-        key(VK_CONTROL.0, KEYEVENTF_KEYUP),
-    ])
-}
-
-fn send_unicode_text(text: &str, delay_ms: u64) -> Result<()> {
-    let mut events: Vec<INPUT> = Vec::with_capacity(text.len() * 4);
+fn type_text(text: &str, delay_ms: u64) -> Result<()> {
+    let none = KEYBD_EVENT_FLAGS(0);
+    let mut events = Vec::with_capacity(text.len() * 2);
     for ch in text.chars() {
-        if ch == '\n' {
-            events.push(key(VK_RETURN.0, KEYBD_EVENT_FLAGS(0)));
-            events.push(key(VK_RETURN.0, KEYEVENTF_KEYUP));
-        } else if ch == '\t' {
-            events.push(key(0x09, KEYBD_EVENT_FLAGS(0)));
-            events.push(key(0x09, KEYEVENTF_KEYUP));
-        } else {
-            let mut buffer = [0u16; 2];
-            for unit in ch.encode_utf16(&mut buffer) {
-                events.push(unicode(*unit, false));
-                events.push(unicode(*unit, true));
+        match ch {
+            '\n' => events.extend([key(VK_RETURN, 0, none), key(VK_RETURN, 0, KEYEVENTF_KEYUP)]),
+            '\t' => events.extend([key(VK_TAB, 0, none), key(VK_TAB, 0, KEYEVENTF_KEYUP)]),
+            '\r' => {}
+            _ => {
+                let mut units = [0u16; 2];
+                for &unit in ch.encode_utf16(&mut units).iter() {
+                    events.push(key(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE));
+                    events.push(key(
+                        VIRTUAL_KEY(0),
+                        unit,
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                    ));
+                }
             }
         }
     }
     if delay_ms == 0 {
         return send(&events);
     }
-    for chunk in events.chunks(2) {
-        send(chunk)?;
+    for pair in events.chunks(2) {
+        send(pair)?;
         thread::sleep(Duration::from_millis(delay_ms));
     }
     Ok(())
 }
 
-fn paste(text: &str, pause_ms: u64) -> Result<()> {
-    let previous: String = get_clipboard(formats::Unicode).unwrap_or_default();
-    if set_clipboard(formats::Unicode, text).is_err() {
-        return Err(anyhow!("could not put the transcript on the clipboard"));
+/// Every memory-backed format on the clipboard, so it can be put back.
+fn snapshot() -> Option<Vec<(u32, Vec<u8>)>> {
+    let _open = Clipboard::new_attempts(10).ok()?;
+    let mut saved = Vec::new();
+    let mut total = 0;
+    for format in raw::EnumFormats::new() {
+        if HANDLE_FORMATS.contains(&format) {
+            continue;
+        }
+        let mut data = Vec::new();
+        if raw::get_vec(format, &mut data).is_ok() {
+            total += data.len();
+            if total > SNAPSHOT_LIMIT {
+                return None;
+            }
+            saved.push((format, data));
+        }
     }
-    let visible: String = get_clipboard(formats::Unicode).unwrap_or_default();
-    if visible != text {
-        return Err(anyhow!("the clipboard did not accept the transcript"));
-    }
-    thread::sleep(Duration::from_millis(80));
-    send_ctrl_v()?;
-    thread::sleep(Duration::from_millis(pause_ms));
-    let current: String = get_clipboard(formats::Unicode).unwrap_or_default();
-    if current == text {
-        let _ = set_clipboard(formats::Unicode, &previous);
-    }
-    Ok(())
+    Some(saved)
 }
 
-/// Insert text at the caret. Clipboard paste is atomic and is the default;
-/// SendInput is the fallback for apps that ignore Ctrl+V.
-pub fn insert_text(
+fn restore(saved: &[(u32, Vec<u8>)]) {
+    let Ok(_open) = Clipboard::new_attempts(10) else {
+        return;
+    };
+    let _ = raw::empty();
+    for (format, data) in saved {
+        let _ = raw::set_without_clear(*format, data);
+    }
+}
+
+fn paste(text: &str, settle_ms: u64) -> Result<()> {
+    let saved = snapshot();
+    set_clipboard(formats::Unicode, text)
+        .map_err(|err| anyhow!("could not use the clipboard: {err}"))?;
+    let ours = raw::seq_num();
+    thread::sleep(Duration::from_millis(40));
+    let none = KEYBD_EVENT_FLAGS(0);
+    let pasted = send(&[
+        key(VK_CONTROL, 0, none),
+        key(VK_V, 0, none),
+        key(VK_V, 0, KEYEVENTF_KEYUP),
+        key(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+    ]);
+    // Give the target app time to read the clipboard before restoring it,
+    // and leave it alone if someone else has written to it meanwhile.
+    if pasted.is_ok() {
+        thread::sleep(Duration::from_millis(settle_ms));
+    }
+    if let Some(saved) = saved {
+        if raw::seq_num() == ours {
+            restore(&saved);
+        }
+    }
+    pasted
+}
+
+/// Insert `text` at the caret with the configured method, falling back to
+/// the other one if it fails.
+pub fn insert(
     text: &str,
     method: &str,
     char_delay_ms: u64,
     paste_delay_ms: u64,
     append_space: bool,
 ) -> Result<()> {
-    if text.is_empty() {
-        return Ok(());
-    }
-    let mut prepared = text.to_string();
-    if append_space && !prepared.ends_with(&[' ', '\n', '\t'][..]) {
-        prepared.push(' ');
+    let mut text = text.to_string();
+    if append_space && !text.ends_with(char::is_whitespace) {
+        text.push(' ');
     }
     match method {
-        "clipboard" => {
-            if let Err(err) = paste(&prepared, paste_delay_ms) {
-                tracing::warn!("clipboard paste failed ({err}); typing instead");
-                send_unicode_text(&prepared, char_delay_ms.max(10))?;
-            }
-            Ok(())
-        }
-        "sendinput" => {
-            if let Err(err) = send_unicode_text(&prepared, char_delay_ms) {
-                tracing::warn!("SendInput failed ({err}); pasting instead");
-                paste(&prepared, paste_delay_ms)?;
-            }
-            Ok(())
-        }
-        "none" => Ok(()),
-        other => Err(anyhow!("unknown injection method '{other}'")),
+        "clipboard" => paste(&text, paste_delay_ms).or_else(|err| {
+            tracing::warn!("paste failed ({err}); typing instead");
+            type_text(&text, char_delay_ms.max(5))
+        }),
+        "sendinput" => type_text(&text, char_delay_ms).or_else(|err| {
+            tracing::warn!("typing failed ({err}); pasting instead");
+            paste(&text, paste_delay_ms)
+        }),
+        _ => Ok(()),
     }
 }

@@ -1,6 +1,4 @@
-//! Minimal TOML configuration with environment overrides.
-//!
-//! English and Caps Lock hold-to-talk are fixed by design.
+//! Optional settings from `%APPDATA%\FastTTS\config.toml`.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -9,44 +7,33 @@ use std::{env, fs, path::PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Empty means the bundled 16.9 MB Cactus Whistle model.
-    pub model: String,
-    /// 0 = let whisper.cpp choose.
-    pub threads: usize,
-    pub initial_prompt: String,
+    /// Remove fillers and stutters, fix capitals and spacing.
     pub cleanup: bool,
-    /// Maximum seconds of audio per streaming chunk.
+    /// Longest stretch of continuous speech sent to the model at once.
     pub chunk_seconds: f32,
-    /// Flush a phrase after this much silence.
+    /// A pause this long ends a phrase, which is transcribed right away.
     pub silence_ms: u64,
-    /// Never flush a chunk shorter than this.
-    pub min_chunk_seconds: f32,
+    /// Shorter Caps Lock taps are ignored.
     pub min_hold_ms: u64,
     pub max_record_seconds: u64,
-    pub hot_mic: bool,
-    pub sounds: bool,
     pub hud: bool,
+    /// "clipboard", "sendinput" or "none".
     pub inject: String,
     pub char_delay_ms: u64,
     pub paste_delay_ms: u64,
     pub append_space: bool,
+    /// Empty means the Windows default microphone.
     pub mic_device: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: String::new(),
-            threads: 0,
-            initial_prompt: String::new(),
             cleanup: true,
-            chunk_seconds: 4.0,
-            silence_ms: 350,
-            min_chunk_seconds: 0.8,
+            chunk_seconds: 6.0,
+            silence_ms: 500,
             min_hold_ms: 250,
-            max_record_seconds: 120,
-            hot_mic: true,
-            sounds: false,
+            max_record_seconds: 300,
             hud: true,
             inject: "clipboard".into(),
             char_delay_ms: 10,
@@ -59,161 +46,102 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let mut config = match config_path() {
-            Some(path) if path.is_file() => {
-                let text = fs::read_to_string(&path)
-                    .with_context(|| format!("could not read {}", path.display()))?;
-                toml::from_str::<Config>(&text)
-                    .with_context(|| format!("invalid config {}", path.display()))?
-            }
-            _ => Self::default(),
+        let Some(path) = config_path().filter(|path| path.is_file()) else {
+            return Ok(Self::default());
         };
-        config.apply_env();
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("could not read {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("invalid settings in {}", path.display()))
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        let config: Self = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
     }
 
-    fn apply_env(&mut self) {
-        // Explicit overrides avoid macro name tricks and keep types honest.
-        if let Ok(v) = env::var("FASTTTS_MODEL") {
-            self.model = v;
-        }
-        if let Ok(v) = env::var("FASTTTS_THREADS") {
-            if let Ok(n) = v.parse() {
-                self.threads = n;
-            }
-        }
-        if let Ok(v) = env::var("FASTTTS_INITIAL_PROMPT") {
-            self.initial_prompt = v;
-        }
-        if let Ok(v) = env::var("FASTTTS_CLEANUP") {
-            self.cleanup = parse_bool(&v, self.cleanup);
-        }
-        if let Ok(v) = env::var("FASTTTS_CHUNK_SECONDS") {
-            if let Ok(n) = v.parse() {
-                self.chunk_seconds = n;
-            }
-        }
-        if let Ok(v) = env::var("FASTTTS_SILENCE_MS") {
-            if let Ok(n) = v.parse() {
-                self.silence_ms = n;
-            }
-        }
-        if let Ok(v) = env::var("FASTTTS_MIN_CHUNK_SECONDS") {
-            if let Ok(n) = v.parse() {
-                self.min_chunk_seconds = n;
-            }
-        }
-        if let Ok(v) = env::var("FASTTTS_MIN_HOLD_MS") {
-            if let Ok(n) = v.parse() {
-                self.min_hold_ms = n;
-            }
-        }
-        if let Ok(v) = env::var("FASTTTS_HOT_MIC") {
-            self.hot_mic = parse_bool(&v, self.hot_mic);
-        }
-        if let Ok(v) = env::var("FASTTTS_SOUNDS") {
-            self.sounds = parse_bool(&v, self.sounds);
-        }
-        if let Ok(v) = env::var("FASTTTS_HUD") {
-            self.hud = parse_bool(&v, self.hud);
-        }
-        if let Ok(v) = env::var("FASTTTS_INJECT") {
-            self.inject = v;
-        }
-        if let Ok(v) = env::var("FASTTTS_CHAR_DELAY_MS") {
-            if let Ok(n) = v.parse() {
-                self.char_delay_ms = n;
-            }
-        }
-        if let Ok(v) = env::var("FASTTTS_PASTE_DELAY_MS") {
-            if let Ok(n) = v.parse() {
-                self.paste_delay_ms = n;
-            }
-        }
-        if let Ok(v) = env::var("FASTTTS_MIC_DEVICE") {
-            self.mic_device = v;
-        }
-    }
-
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            !self.initial_prompt.contains('\0'),
-            "initial_prompt has a NUL byte"
-        );
-        anyhow::ensure!(self.min_hold_ms <= 5000, "min_hold_ms must be <= 5000");
-        anyhow::ensure!(
-            (0.5..=10.0).contains(&self.chunk_seconds),
-            "chunk_seconds must be between 0.5 and 10"
-        );
-        anyhow::ensure!(self.silence_ms <= 3000, "silence_ms must be <= 3000");
-        anyhow::ensure!(
-            (0.1..=5.0).contains(&self.min_chunk_seconds),
-            "min_chunk_seconds must be between 0.1 and 5"
+            (2.0..=20.0).contains(&self.chunk_seconds),
+            "chunk_seconds must be between 2 and 20"
         );
         anyhow::ensure!(
-            self.max_record_seconds > 0,
-            "max_record_seconds must be positive"
+            (200..=3000).contains(&self.silence_ms),
+            "silence_ms must be between 200 and 3000"
+        );
+        anyhow::ensure!(
+            (self.silence_ms as f32) < self.chunk_seconds * 500.0,
+            "silence_ms must be less than half of chunk_seconds"
+        );
+        anyhow::ensure!(self.min_hold_ms <= 1000, "min_hold_ms must be at most 1000");
+        anyhow::ensure!(
+            (5..=3600).contains(&self.max_record_seconds),
+            "max_record_seconds must be between 5 and 3600"
         );
         anyhow::ensure!(
             matches!(self.inject.as_str(), "clipboard" | "sendinput" | "none"),
-            "inject must be clipboard, sendinput or none"
+            "inject must be \"clipboard\", \"sendinput\" or \"none\""
+        );
+        anyhow::ensure!(
+            self.char_delay_ms <= 200,
+            "char_delay_ms must be at most 200"
+        );
+        anyhow::ensure!(
+            (50..=5000).contains(&self.paste_delay_ms),
+            "paste_delay_ms must be between 50 and 5000"
         );
         Ok(())
-    }
-
-    pub fn model_path(&self) -> PathBuf {
-        if !self.model.is_empty() {
-            return PathBuf::from(&self.model);
-        }
-        project_root().join("models/cactus/whistle.cact")
-    }
-}
-
-fn parse_bool(value: &str, fallback: bool) -> bool {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
-        _ => fallback,
     }
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    if let Ok(path) = env::var("FASTTTS_CONFIG") {
-        return Some(PathBuf::from(path));
-    }
-    env::var("APPDATA")
-        .ok()
-        .map(|root| PathBuf::from(root).join("FastTTS/config.toml"))
+    env::var_os("APPDATA").map(|root| PathBuf::from(root).join("FastTTS").join("config.toml"))
 }
 
 pub fn log_dir() -> PathBuf {
-    if let Ok(root) = env::var("FASTTTS_DATA_DIR") {
-        return PathBuf::from(root).join("logs");
-    }
-    let root = env::var("LOCALAPPDATA")
-        .or_else(|_| env::var("APPDATA"))
-        .unwrap_or_else(|_| "C:\\Users\\mich\\AppData\\Local".into());
-    PathBuf::from(root).join("FastTTS/logs")
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("FastTTS")
+        .join("logs")
 }
 
-pub fn project_root() -> PathBuf {
-    if let Ok(root) = env::var("FASTTTS_HOME") {
-        return PathBuf::from(root);
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn defaults_are_valid_and_every_key_parses() {
+        Config::default().validate().unwrap();
+        let config = Config::parse(
+            r#"
+            cleanup = false
+            chunk_seconds = 8.0
+            silence_ms = 400
+            min_hold_ms = 300
+            max_record_seconds = 60
+            hud = false
+            inject = "sendinput"
+            char_delay_ms = 5
+            paste_delay_ms = 300
+            append_space = false
+            mic_device = "Headset"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.hud);
+        assert_eq!(config.inject, "sendinput");
     }
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fasttts.exe"));
-    let exe_dir = exe.parent().unwrap_or(&exe).to_path_buf();
-    for start in [cwd, exe_dir] {
-        let mut candidate = start;
-        loop {
-            if candidate.join("models/cactus/whistle.cact").is_file() {
-                return candidate;
-            }
-            if !candidate.pop() {
-                break;
-            }
-        }
+
+    #[test]
+    fn rejects_typos_and_bad_values() {
+        assert!(Config::parse("chunk_secs = 4.0").is_err());
+        assert!(Config::parse("inject = \"keyboard\"").is_err());
+        assert!(Config::parse("silence_ms = 50").is_err());
+        assert!(Config::parse(
+            "chunk_seconds = 2.0
+silence_ms = 1500"
+        )
+        .is_err());
     }
-    exe.parent().unwrap_or(&exe).to_path_buf()
 }
