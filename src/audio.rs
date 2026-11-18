@@ -17,6 +17,11 @@ use std::{
 /// Sample rate the speech model expects.
 pub const RATE: usize = 16_000;
 const PRE_ROLL: usize = RATE / 4;
+/// The noise floor follows quiet moments at once but rises only 2 dB per
+/// second, so speech cannot drag it up between pauses.
+const NOISE_RISE_PER_SECOND: f32 = 0.230_258_5; // ln(10^(2/20))
+const NOISE_START: f32 = 0.001;
+const NOISE_MIN: f32 = 1e-6;
 
 /// Loudest RMS since the HUD last looked. Every audio callback records into
 /// it and the HUD takes the value once per frame, so no peak is missed.
@@ -109,6 +114,7 @@ struct Capture {
     pending: Vec<f32>,
     captured: usize,
     capturing: bool,
+    noise: f32,
 }
 
 struct Shared {
@@ -149,6 +155,8 @@ impl Shared {
         }
         let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
         self.meter.record(rms);
+        let rise = (NOISE_RISE_PER_SECOND * samples.len() as f32 / RATE as f32).exp();
+        capture.noise = (capture.noise * rise).min(rms).max(NOISE_MIN);
 
         if capture.capturing {
             let room = self.max_samples.saturating_sub(capture.captured);
@@ -183,6 +191,7 @@ impl Recorder {
                     pending: Vec::new(),
                     captured: 0,
                     capturing: false,
+                    noise: NOISE_START,
                 }),
                 meter: Arc::new(Meter::default()),
                 lost: AtomicBool::new(true),
@@ -235,6 +244,11 @@ impl Recorder {
     /// True after the device disappeared; the app then calls `reopen`.
     pub fn is_lost(&self) -> bool {
         self.shared.lost.load(Ordering::Acquire)
+    }
+
+    /// Current room noise level (RMS).
+    pub fn noise_floor(&self) -> f32 {
+        self.shared.lock().noise
     }
 
     pub fn meter(&self) -> Arc<Meter> {
@@ -389,6 +403,7 @@ mod tests {
                 pending: Vec::new(),
                 captured: 0,
                 capturing: true,
+                noise: NOISE_START,
             }),
             meter: Arc::new(Meter::default()),
             lost: AtomicBool::new(false),

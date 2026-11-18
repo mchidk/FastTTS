@@ -48,9 +48,13 @@ const BAR_COUNT: usize = 38;
 const BAR_WIDTH: f32 = 4.0;
 const BAR_TOP: f32 = 78.0;
 const BAR_BOTTOM: f32 = 128.0;
-/// Level mapping for the bars: -54 dBFS is flat, -12 dBFS is full height.
-const FLOOR_DB: f32 = -54.0;
-const CEIL_DB: f32 = -12.0;
+/// The bars auto-range: full height is the recent peak, flat is this many
+/// dB below it, so a soft laptop array and a loud headset both fill them.
+const RANGE_DB: f32 = 30.0;
+/// The recent peak never drops below this, so room noise stays flat.
+const QUIET_PEAK_DB: f32 = -56.0;
+/// How fast the recent peak falls back after loud speech (dB per frame).
+const PEAK_FALL_DB: f32 = 0.15;
 const FRAME_MS: u32 = 33;
 const FADE_STEP: u8 = 51;
 const ERROR_SECONDS: f32 = 2.4;
@@ -394,17 +398,12 @@ impl Painter {
     }
 }
 
-/// Map a microphone RMS to a bar height on a decibel scale.
-fn level_to_bar(rms: f32) -> f32 {
-    let db = 20.0 * rms.max(1e-6).log10();
-    ((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)).clamp(0.0, 1.0)
-}
-
 /// Bar animation state.
 struct Bars {
     history: VecDeque<f32>,
     display: Vec<f32>,
     started: Instant,
+    peak_db: f32,
 }
 
 impl Bars {
@@ -413,7 +412,15 @@ impl Bars {
             history: VecDeque::from(vec![0.0; BAR_COUNT]),
             display: vec![0.0; BAR_COUNT],
             started: Instant::now(),
+            peak_db: QUIET_PEAK_DB,
         }
+    }
+
+    /// Bar height for a microphone RMS, relative to the recent peak.
+    fn level(&mut self, rms: f32) -> f32 {
+        let db = 20.0 * rms.max(1e-6).log10();
+        self.peak_db = db.max(self.peak_db - PEAK_FALL_DB).max(QUIET_PEAK_DB);
+        ((db - (self.peak_db - RANGE_DB)) / RANGE_DB).clamp(0.0, 1.0)
     }
 
     fn step(&mut self, view: &View, level: f32) -> &[f32] {
@@ -421,7 +428,8 @@ impl Bars {
         let target: Vec<f32> = match view {
             View::Listening => {
                 self.history.pop_front();
-                self.history.push_back(level_to_bar(level));
+                let bar = self.level(level);
+                self.history.push_back(bar);
                 self.history.iter().map(|v| 0.06 + 0.94 * v).collect()
             }
             View::Transcribing => {
@@ -676,15 +684,20 @@ mod tests {
     }
 
     #[test]
-    fn speech_levels_fill_the_bars() {
-        assert_eq!(level_to_bar(0.0), 0.0);
-        assert_eq!(level_to_bar(0.000_03), 0.0, "-90 dBFS room is flat");
-        assert!(
-            level_to_bar(0.03) > 0.5,
-            "normal speech reaches half height"
-        );
-        assert!(level_to_bar(0.1) > 0.75);
-        assert_eq!(level_to_bar(0.5), 1.0);
+    fn bars_auto_range_to_the_voice() {
+        let mut bars = Bars::new();
+        assert_eq!(bars.level(0.0), 0.0);
+        assert_eq!(bars.level(0.000_03), 0.0, "-90 dBFS room is flat");
+        // Soft speech on a laptop array (-48 dBFS) fills the bars...
+        assert!(bars.level(0.004) > 0.9);
+        // ...and its quieter syllables still move them.
+        assert!(bars.level(0.0013) > 0.4);
+        // A loud headset does the same after a moment.
+        let mut bars = Bars::new();
+        bars.level(0.2);
+        assert!(bars.level(0.2) > 0.95);
+        assert!(bars.level(0.02) > 0.3);
+        assert_eq!(bars.level(0.000_03), 0.0);
     }
 
     #[test]

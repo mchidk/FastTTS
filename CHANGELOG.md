@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.2 - 2026-11-18
+
+### Fixed
+
+- Takes often sent nothing. Speech had to be louder than a fixed -42 dBFS
+  to count, and soft voices on laptop microphone arrays sit around -48 dBFS,
+  so whole takes were thrown away as silence. The voice threshold now
+  follows the room's noise level (down to -56 dBFS on quiet, processed
+  microphones; never stricter than before on noisy ones).
+- The oscilloscope ranges itself to your voice, so soft and loud
+  microphones both fill the bars.
+- The log records each take's loudest level, voice threshold and voiced
+  time, so a missed take can be diagnosed.
+
 ## 1.0.1 - 2026-11-18
 
 ### Fixed

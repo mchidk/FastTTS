@@ -28,9 +28,10 @@ impl Transcriber {
         })
     }
 
-    /// Transcribe one chunk of 16 kHz mono audio.
+    /// Transcribe one chunk of 16 kHz mono audio. The chunker has already
+    /// checked that it holds speech.
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
-        if !crate::stream::has_speech(samples) {
+        if samples.is_empty() {
             return Ok(String::new());
         }
         let audio = normalize(samples);
@@ -56,7 +57,7 @@ fn normalize(samples: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::stream::{join, Chunker};
+    use crate::stream::{join, voice_threshold, Chunker};
     use std::time::Instant;
 
     /// The 16 kHz mono 16-bit speech fixture in `tests/fixtures`.
@@ -108,17 +109,10 @@ pub(crate) mod tests {
 
     /// One test owns the model: Whistle allows a single engine per process.
     #[test]
-    fn transcribes_whole_streamed_and_quiet_speech() {
+    fn transcribes_whole_streamed_and_soft_speech() {
         let mut model = Transcriber::load().expect("model");
-
-        let start = Instant::now();
-        assert!(model.transcribe(&vec![0.0; 32_000]).unwrap().is_empty());
-        assert!(
-            start.elapsed().as_millis() < 20,
-            "silence must skip the model"
-        );
-
         let speech = speech();
+
         let start = Instant::now();
         let whole = crate::cleanup::clean_transcript(&model.transcribe(&speech).unwrap());
         let seconds = start.elapsed().as_secs_f32();
@@ -126,31 +120,46 @@ pub(crate) mod tests {
         println!("whole ({seconds:.2}s for {audio_seconds:.1}s): {whole}");
         assert!(wer(REFERENCE, &whole) < 0.15, "whole: {whole}");
 
-        // Stream exactly as the app does: 33 ms slices, default settings.
+        // A processed laptop mic array: -90 dBFS room, so the adaptive
+        // threshold settles at its floor.
+        let laptop = voice_threshold(0.000_03);
+        let (streamed, chunks) = stream_take(&mut model, &speech, laptop);
+        println!("streamed ({chunks} chunks): {streamed}");
+        assert!(chunks >= 2, "the fixture must exercise streaming");
+        assert!(wer(REFERENCE, &streamed) < 0.2, "streamed: {streamed}");
+
+        // Soft speech on that mic, measured around -48 dBFS. The old fixed
+        // -42 dBFS gate threw these takes away as silence.
+        for (gain, label) in [(0.03f32, "-48 dBFS"), (0.015, "-54 dBFS")] {
+            let soft: Vec<f32> = speech.iter().map(|x| x * gain).collect();
+            let (old, _) = stream_take(&mut model, &soft, voice_threshold(1.0));
+            let (text, chunks) = stream_take(&mut model, &soft, laptop);
+            println!("soft {label} ({chunks} chunks): {text} | old gate: [{old}]");
+            assert!(wer(REFERENCE, &text) < 0.2, "soft {label}: {text}");
+        }
+
+        // Silence never reaches the model.
+        let (text, chunks) = stream_take(&mut model, &vec![0.0; 48_000], laptop);
+        assert!(text.is_empty() && chunks == 0);
+    }
+
+    /// Run audio through the chunker and model exactly as a take does:
+    /// 33 ms slices, default settings.
+    fn stream_take(model: &mut Transcriber, audio: &[f32], threshold: f32) -> (String, usize) {
         let config = crate::config::Config::default();
-        let mut chunker = Chunker::new(config.chunk_seconds, config.silence_ms);
+        let mut chunker = Chunker::new(config.chunk_seconds, config.silence_ms, threshold);
         let mut chunks = Vec::new();
-        for slice in speech.chunks(528) {
+        for slice in audio.chunks(528) {
             chunker.push(slice, &mut chunks);
         }
         chunks.extend(chunker.finish());
-        assert!(chunks.len() >= 2, "the fixture must exercise streaming");
-        let tail = chunks.last().unwrap().audio.len() as f32 / 16_000.0;
         let parts: Vec<(String, bool)> = chunks
             .iter()
             .map(|c| (model.transcribe(&c.audio).unwrap(), c.continues))
             .collect();
-        let streamed = crate::cleanup::clean_transcript(&join(&parts));
-        println!(
-            "streamed ({} chunks, {tail:.1}s tail): {streamed}",
-            chunks.len()
-        );
-        assert!(wer(REFERENCE, &streamed) < 0.2, "streamed: {streamed}");
-
-        // A quiet microphone (-26 dB) must still transcribe.
-        let quiet: Vec<f32> = speech.iter().map(|x| x * 0.05).collect();
-        let text = crate::cleanup::clean_transcript(&model.transcribe(&quiet).unwrap());
-        println!("quiet: {text}");
-        assert!(wer(REFERENCE, &text) < 0.2, "quiet: {text}");
+        (
+            crate::cleanup::clean_transcript(&join(&parts)),
+            chunks.len(),
+        )
     }
 }

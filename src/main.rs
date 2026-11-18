@@ -145,7 +145,11 @@ impl App {
         self.active = Some(Take {
             id: self.next_take,
             started: Instant::now(),
-            chunker: Chunker::new(self.config.chunk_seconds, self.config.silence_ms),
+            chunker: Chunker::new(
+                self.config.chunk_seconds,
+                self.config.silence_ms,
+                stream::voice_threshold(self.recorder.noise_floor()),
+            ),
             parts: Vec::new(),
             pending: 0,
             failed: false,
@@ -159,14 +163,23 @@ impl App {
         };
         let tail = self.recorder.stop();
         let held = take.started.elapsed();
-        info!("take {} recorded {:.2}s", take.id, held.as_secs_f32());
         if held < Duration::from_millis(self.config.min_hold_ms) {
+            info!("take {} ignored: {:.2}s tap", take.id, held.as_secs_f32());
             self.refresh();
             return;
         }
         let mut chunks = Vec::new();
         take.chunker.push(&tail, &mut chunks);
         chunks.extend(take.chunker.finish());
+        let db = |rms: f32| 20.0 * rms.max(1e-6).log10();
+        info!(
+            "take {} recorded {:.2}s: loudest {:.0} dBFS, voice threshold {:.0} dBFS, {} ms voiced",
+            take.id,
+            held.as_secs_f32(),
+            db(take.chunker.loudest),
+            db(take.chunker.threshold()),
+            take.chunker.voiced_total * 20,
+        );
         for chunk in chunks {
             self.send(&mut take, chunk);
         }

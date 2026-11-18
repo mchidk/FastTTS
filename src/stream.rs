@@ -9,8 +9,18 @@ use crate::audio::RATE;
 
 /// 20 ms analysis frame.
 const FRAME: usize = RATE / 50;
-/// Frame RMS above this counts as voice (about -42 dBFS).
-const VOICE_RMS: f32 = 0.008;
+/// Voice must be this much louder than the room (about +14 dB).
+const OVER_NOISE: f32 = 5.0;
+/// The voice threshold never drops below -56 dBFS or rises above -42 dBFS.
+const MIN_VOICE_RMS: f32 = 0.0015;
+const MAX_VOICE_RMS: f32 = 0.008;
+
+/// Frame RMS that counts as voice, given the room's noise floor. A
+/// processed laptop array sits near -90 dBFS and quiet speech near -45, so
+/// a fixed threshold either misses soft voices or triggers on noisy rooms.
+pub fn voice_threshold(noise_floor: f32) -> f32 {
+    (noise_floor * OVER_NOISE).clamp(MIN_VOICE_RMS, MAX_VOICE_RMS)
+}
 /// A chunk needs at least this many voiced frames (100 ms) to be worth
 /// sending to the model; shorter blips are clicks and key taps.
 const MIN_VOICED_FRAMES: usize = 5;
@@ -29,6 +39,10 @@ pub struct Chunk {
 }
 
 pub struct Chunker {
+    threshold: f32,
+    /// Loudest frame and voiced frame count of the whole take, for the log.
+    pub loudest: f32,
+    pub voiced_total: usize,
     max_len: usize,
     pause_frames: usize,
     buf: Vec<f32>,
@@ -45,17 +59,20 @@ fn rms(samples: &[f32]) -> f32 {
 }
 
 /// True when `samples` holds enough voiced frames to be worth transcribing.
-pub fn has_speech(samples: &[f32]) -> bool {
+pub fn has_speech(samples: &[f32], threshold: f32) -> bool {
     samples
         .chunks(FRAME)
-        .filter(|frame| rms(frame) > VOICE_RMS)
+        .filter(|frame| rms(frame) > threshold)
         .count()
         >= MIN_VOICED_FRAMES
 }
 
 impl Chunker {
-    pub fn new(chunk_seconds: f32, pause_ms: u64) -> Self {
+    pub fn new(chunk_seconds: f32, pause_ms: u64, threshold: f32) -> Self {
         Self {
+            threshold,
+            loudest: 0.0,
+            voiced_total: 0,
             max_len: ((chunk_seconds * RATE as f32) as usize).max(MIN_PHRASE + FRAME),
             pause_frames: (pause_ms as usize).div_ceil(20).max(1),
             buf: Vec::new(),
@@ -63,6 +80,10 @@ impl Chunker {
             voiced: 0,
             quiet: 0,
         }
+    }
+
+    pub fn threshold(&self) -> f32 {
+        self.threshold
     }
 
     /// Feed new samples; completed chunks are appended to `out`.
@@ -78,7 +99,7 @@ impl Chunker {
     /// Flush whatever is left when Caps Lock is released.
     pub fn finish(&mut self) -> Option<Chunk> {
         let audio = std::mem::take(&mut self.buf);
-        let speech = self.voiced >= MIN_VOICED_FRAMES || has_speech(&audio);
+        let speech = self.voiced >= MIN_VOICED_FRAMES || has_speech(&audio, self.threshold);
         self.reset();
         speech.then_some(Chunk {
             audio,
@@ -96,8 +117,10 @@ impl Chunker {
     fn end_frame(&mut self, out: &mut Vec<Chunk>) {
         let level = rms(&self.buf[self.buf.len() - FRAME..]);
         self.frames.push(level);
-        if level > VOICE_RMS {
+        self.loudest = self.loudest.max(level);
+        if level > self.threshold {
             self.voiced += 1;
+            self.voiced_total += 1;
             self.quiet = 0;
         } else {
             self.quiet += 1;
@@ -129,12 +152,13 @@ impl Chunker {
             let rest = self.buf.split_off(cut);
             let audio = std::mem::replace(&mut self.buf, rest);
             self.frames.drain(..cut / FRAME);
-            self.voiced = self.frames.iter().filter(|&&f| f > VOICE_RMS).count();
+            let threshold = self.threshold;
+            self.voiced = self.frames.iter().filter(|&&f| f > threshold).count();
             self.quiet = self
                 .frames
                 .iter()
                 .rev()
-                .take_while(|&&f| f <= VOICE_RMS)
+                .take_while(|&&f| f <= threshold)
                 .count();
             // Only a cut with speech right after it splits a sentence.
             out.push(Chunk {
@@ -223,7 +247,7 @@ mod tests {
 
     #[test]
     fn silence_never_produces_chunks() {
-        let mut chunker = Chunker::new(4.0, 350);
+        let mut chunker = Chunker::new(4.0, 350, MAX_VOICE_RMS);
         let mut out = Vec::new();
         chunker.push(&silence(20.0), &mut out);
         assert!(out.is_empty());
@@ -233,7 +257,7 @@ mod tests {
 
     #[test]
     fn a_pause_ends_a_phrase() {
-        let mut chunker = Chunker::new(8.0, 350);
+        let mut chunker = Chunker::new(8.0, 350, MAX_VOICE_RMS);
         let mut out = Vec::new();
         chunker.push(&silence(0.5), &mut out);
         chunker.push(&tone(1.5, 0.2), &mut out);
@@ -249,7 +273,7 @@ mod tests {
 
     #[test]
     fn long_speech_is_cut_at_the_quietest_point() {
-        let mut chunker = Chunker::new(4.0, 350);
+        let mut chunker = Chunker::new(4.0, 350, MAX_VOICE_RMS);
         let mut out = Vec::new();
         let mut speech = tone(3.0, 0.2);
         speech.extend(tone(0.1, 0.001)); // a short gap between words
@@ -268,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_cut_in_trailing_silence_does_not_continue() {
-        let mut chunker = Chunker::new(4.0, 500);
+        let mut chunker = Chunker::new(4.0, 500, MAX_VOICE_RMS);
         let mut out = Vec::new();
         chunker.push(&tone(3.7, 0.2), &mut out);
         chunker.push(&silence(0.45), &mut out);
@@ -278,7 +302,7 @@ mod tests {
 
     #[test]
     fn clicks_are_not_speech() {
-        let mut chunker = Chunker::new(4.0, 350);
+        let mut chunker = Chunker::new(4.0, 350, MAX_VOICE_RMS);
         let mut out = Vec::new();
         chunker.push(&silence(0.5), &mut out);
         chunker.push(&tone(0.04, 0.5), &mut out);
@@ -288,9 +312,20 @@ mod tests {
     }
 
     #[test]
+    fn the_voice_threshold_follows_the_room() {
+        // Processed laptop array: -90 dBFS room, so soft speech counts.
+        assert_eq!(voice_threshold(0.000_03), MIN_VOICE_RMS);
+        // Raw mic at -60 dBFS: about +14 dB above it.
+        assert!((voice_threshold(0.001) - 0.005).abs() < 1e-6);
+        // Noisy room: never stricter than the old fixed gate.
+        assert_eq!(voice_threshold(0.01), MAX_VOICE_RMS);
+    }
+
+    #[test]
     fn speech_gate() {
-        assert!(!has_speech(&[]));
-        assert!(!has_speech(&silence(1.0)));
+        let gate = MAX_VOICE_RMS;
+        assert!(!has_speech(&[], gate));
+        assert!(!has_speech(&silence(1.0), gate));
         for amp in [0.002f32, 0.006, 0.012] {
             let noise: Vec<f32> = (0..RATE)
                 .map(|i| {
@@ -298,9 +333,9 @@ mod tests {
                     (x - 1.0) * amp
                 })
                 .collect();
-            assert!(!has_speech(&noise), "room noise {amp} must be gated");
+            assert!(!has_speech(&noise, gate), "room noise {amp} must be gated");
         }
-        assert!(has_speech(&tone(0.5, 0.05)));
+        assert!(has_speech(&tone(0.5, 0.05), gate));
     }
 
     #[test]
