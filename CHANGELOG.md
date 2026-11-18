@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.1 - 2026-11-18
+
+### Fixed
+
+- FastTTS closed on the first dictation without pasting anything. The
+  installed 1.0.0 exe was built before a text-cleanup dependency fix.
+  `install.ps1` now builds the release itself, so the installed app always
+  matches the source.
+- Text cleanup is checked when FastTTS starts, and an unexpected error now
+  shows a message instead of the app silently disappearing.
+
 ## 1.0.0 - 2026-11-18
 
 First release.

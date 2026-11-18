@@ -473,7 +473,11 @@ fn setup_logging() {
             .with_ansi(false)
             .init();
     }
-    std::panic::set_hook(Box::new(|panic| error!("crashed: {panic}")));
+    std::panic::set_hook(Box::new(|panic| {
+        error!("crashed: {panic}");
+        let text = format!("FastTTS stopped because of an internal error:\n\n{panic}");
+        message_box(&text, MB_ICONERROR);
+    }));
 }
 
 /// False when another FastTTS is already running.
@@ -538,6 +542,9 @@ fn spawn_workers(
 }
 
 fn run() -> Result<()> {
+    // Compile the cleanup patterns now: a broken build fails at launch,
+    // not after the user has spoken.
+    cleanup::clean_transcript("um, ready");
     let config = Config::load()?;
     let hwnd = create_window()?;
     let recorder = Recorder::new(&config.mic_device, config.max_record_seconds);

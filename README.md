@@ -35,11 +35,10 @@ You need Windows 11 (x64) and, to build it:
 
 ```powershell
 rustup target add x86_64-pc-windows-gnullvm
-cargo build --release
 .\install.ps1
 ```
 
-`install.ps1` copies `fasttts.exe` to `%LOCALAPPDATA%\Programs\FastTTS`,
+`install.ps1` builds the release, copies `fasttts.exe` to `%LOCALAPPDATA%\Programs\FastTTS`,
 adds Desktop and Start menu shortcuts and starts the app. Add `-Startup` to
 start FastTTS when you sign in, or run `.\install.ps1 -Uninstall` to remove it.
 

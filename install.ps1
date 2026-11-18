@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Copies the self-contained fasttts.exe to %LOCALAPPDATA%\Programs\FastTTS,
-  adds Desktop and Start menu shortcuts and starts it. Build it first with
-  `cargo build --release`.
+  adds Desktop and Start menu shortcuts and starts it. It builds the release
+  first, so the installed exe always matches the source.
 
 .EXAMPLE
   .\install.ps1            # install and start
@@ -42,10 +42,14 @@ if ($Uninstall) {
   return
 }
 
-$built = Join-Path $PSScriptRoot 'target\x86_64-pc-windows-gnullvm\release\fasttts.exe'
-if (-not (Test-Path $built)) {
-  throw 'Build FastTTS first: cargo build --release'
+Push-Location $PSScriptRoot
+try {
+  cargo build --release
+  if ($LASTEXITCODE -ne 0) { throw 'cargo build --release failed' }
+} finally {
+  Pop-Location
 }
+$built = Join-Path $PSScriptRoot 'target\x86_64-pc-windows-gnullvm\release\fasttts.exe'
 Stop-FastTTS
 New-Item -ItemType Directory -Force $target | Out-Null
 Copy-Item $built $exe -Force

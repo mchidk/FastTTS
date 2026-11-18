@@ -1,6 +1,6 @@
 [package]
 name = "fasttts"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Hold Caps Lock, speak English, let go: fast local dictation for Windows"
