@@ -536,12 +536,19 @@ fn spawn_workers(
     thread::Builder::new()
         .name("fasttts-input".into())
         .spawn(move || {
+            let injector = match inject::Injector::new() {
+                Ok(injector) => injector,
+                Err(err) => {
+                    let _ = events.send(Event::InputFailed(format!("{err:#}")));
+                    return;
+                }
+            };
             for text in input {
-                let inserted = inject::insert(
+                let inserted = injector.insert(
                     &text,
                     &config.inject,
                     config.char_delay_ms,
-                    config.paste_delay_ms,
+                    config.paste_timeout_ms,
                     config.append_space,
                 );
                 if let Err(err) = inserted {

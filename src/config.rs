@@ -20,7 +20,8 @@ pub struct Config {
     /// "clipboard", "sendinput" or "none".
     pub inject: String,
     pub char_delay_ms: u64,
-    pub paste_delay_ms: u64,
+    /// How long an app may take to read a paste before the text is typed.
+    pub paste_timeout_ms: u64,
     pub append_space: bool,
     /// Empty means the Windows default microphone.
     pub mic_device: String,
@@ -37,7 +38,7 @@ impl Default for Config {
             hud: true,
             inject: "clipboard".into(),
             char_delay_ms: 10,
-            paste_delay_ms: 400,
+            paste_timeout_ms: 2000,
             append_space: true,
             mic_device: String::new(),
         }
@@ -87,8 +88,8 @@ impl Config {
             "char_delay_ms must be at most 200"
         );
         anyhow::ensure!(
-            (50..=5000).contains(&self.paste_delay_ms),
-            "paste_delay_ms must be between 50 and 5000"
+            (200..=10_000).contains(&self.paste_timeout_ms),
+            "paste_timeout_ms must be between 200 and 10000"
         );
         Ok(())
     }
@@ -123,7 +124,7 @@ mod tests {
             hud = false
             inject = "sendinput"
             char_delay_ms = 5
-            paste_delay_ms = 300
+            paste_timeout_ms = 3000
             append_space = false
             mic_device = "Headset"
             "#,

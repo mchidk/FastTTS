@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.3 - 2026-11-18
+
+### Fixed
+
+- Dictation sometimes pasted nothing in Windows 11 Notepad. Notepad reads
+  the clipboard asynchronously, and the clipboard was put back after a
+  fixed 400 ms, possibly before Notepad had read the text. The text is now
+  offered with delayed rendering: Windows reports when the app actually
+  reads it, and only then is the previous clipboard restored. If no app
+  reads it within `paste_timeout_ms` (2 s), the text is typed instead.
+- Dictated text no longer appears in Windows clipboard history or cloud
+  clipboard.
+
+### Changed
+
+- `paste_delay_ms` is replaced by `paste_timeout_ms`.
+
 ## 1.0.2 - 2026-11-18
 
 ### Fixed

@@ -72,7 +72,7 @@ max_record_seconds = 300   # a take stops by itself after this long
 hud = true                 # the oscilloscope above the taskbar
 inject = "clipboard"       # "clipboard", "sendinput" (typed) or "none"
 char_delay_ms = 10         # pause between typed characters for "sendinput"
-paste_delay_ms = 400       # wait before the clipboard is restored
+paste_timeout_ms = 2000    # time an app has to take a paste before it is typed
 append_space = true        # add a space after each take
 mic_device = ""            # microphone name; empty means the Windows default
 ```
@@ -85,8 +85,10 @@ Restart FastTTS after changing the file.
 - **Privacy.** Audio and text never leave your PC. The microphone stays open
   for the pre-roll, so Windows shows its microphone indicator while FastTTS
   runs. The log records timings and text lengths, never what you said.
-- **Your clipboard is kept.** Pasting borrows the clipboard for a moment and
-  then puts back what was on it before.
+- **Your clipboard is kept.** Pasting borrows the clipboard until the app
+  has actually read the text, then puts back what was on it before.
+  Dictated text stays out of Windows clipboard history. If an app ignores
+  the paste, FastTTS types the text instead.
 - **Administrator windows.** Windows does not let a normal app type into a
   program that runs as administrator. The HUD then shows INPUT BLOCKED.
 - **Microphone unplugged?** FastTTS keeps trying to reconnect every two
