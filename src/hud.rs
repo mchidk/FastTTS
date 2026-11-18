@@ -635,21 +635,3 @@ fn hud_thread(
     }
     ctx.cleanup_gdi();
 }
-
-#[cfg(test)]
-mod preview_tests {
-    use super::{Hud, HudMode};
-    use std::{path::PathBuf, thread, time::Duration};
-
-    #[ignore]
-    #[test]
-    fn preview() {
-        let root = PathBuf::from(r"C:\repros\FastTTS");
-        let hud = Hud::new(&root).expect("hud");
-        hud.set_mode(HudMode::Recording, "");
-        for i in 0..240 {
-            hud.push_level(0.02 + 0.25 * (i as f32 * 0.18).abs().sin());
-            thread::sleep(Duration::from_millis(33));
-        }
-    }
-}

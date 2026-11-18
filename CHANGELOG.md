@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3 - 2026-11-18
+
+### Fixed
+
+- Random/gibberish dictation on microphones that expose stereo or multi-channel
+  audio. The recorder now always extracts the left channel from interleaved
+  input instead of treating the buffer as mono, and prefers mono configurations
+  when the device offers them. Logging now includes the channel count.
+
 ## 0.2.2 - 2026-11-17
 
 ### Fixed

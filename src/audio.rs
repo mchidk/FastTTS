@@ -29,32 +29,52 @@ struct RecorderState {
     active: AtomicBool,
     level: AtomicU32,
     device_rate: AtomicU32,
+    channels: AtomicU32,
     max_samples: usize,
 }
 
 impl RecorderState {
+    /// Downmix interleaved device audio to mono (mics here expose 4 channels).
+    fn mono_f32<'a>(&self, data: &'a [f32]) -> Vec<f32> {
+        let stride = self.channels.load(Ordering::Relaxed).max(1) as usize;
+        data.chunks(stride)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+            .collect()
+    }
+
+    fn mono_i16(&self, data: &[i16]) -> Vec<f32> {
+        let stride = self.channels.load(Ordering::Relaxed).max(1) as usize;
+        data.chunks(stride)
+            .map(|frame| frame.iter().map(|v| *v as f32 / 32768.0).sum::<f32>() / frame.len() as f32)
+            .collect()
+    }
+
     fn push_f32(&self, data: &[f32]) {
-        let rms = (data.iter().map(|x| x * x).sum::<f32>() / data.len().max(1) as f32).sqrt();
-        self.level.store(rms.to_bits(), Ordering::Relaxed);
+        let samples = self.mono_f32(data);
+        self.store_level(&samples);
         let pre_roll = (0.25 * self.device_rate.load(Ordering::Relaxed) as f64) as usize;
         let mut inner = self.inner.lock();
-        for sample in data.iter().copied() {
+        for sample in samples {
             Self::push_sample(&mut inner, sample, pre_roll);
         }
     }
 
     fn push_i16(&self, data: &[i16]) {
-        let mut rms: f32 = 0.0;
+        let samples = self.mono_i16(data);
+        self.store_level(&samples);
         let pre_roll = (0.25 * self.device_rate.load(Ordering::Relaxed) as f64) as usize;
         let mut inner = self.inner.lock();
-        for value in data.iter() {
-            let sample = *value as f32 / 32768.0;
-            rms += sample * sample;
+        for sample in samples {
             Self::push_sample(&mut inner, sample, pre_roll);
         }
-        if !data.is_empty() {
-            self.level.store((rms / data.len() as f32).sqrt().to_bits(), Ordering::Relaxed);
+    }
+
+    fn store_level(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
         }
+        let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
+        self.level.store(rms.to_bits(), Ordering::Relaxed);
     }
 
     fn push_sample(inner: &mut Inner, sample: f32, pre_roll: usize) {
@@ -83,6 +103,7 @@ impl Recorder {
                 active: AtomicBool::new(false),
                 level: AtomicU32::new(0),
                 device_rate: AtomicU32::new(SAMPLE_RATE),
+                channels: AtomicU32::new(1),
                 max_samples: (max_seconds as usize) * SAMPLE_RATE as usize,
             }),
             stream: Mutex::new(None),
@@ -104,11 +125,15 @@ impl Recorder {
         let state = Arc::clone(&self.state);
 
         let rate = config.sample_rate;
+        let channels = config.channels as u32;
+        let mut stream_config: StreamConfig = config;
+        stream_config.buffer_size = cpal::BufferSize::Fixed(1024);
         self.state.device_rate.store(rate, Ordering::Relaxed);
+        self.state.channels.store(channels, Ordering::Relaxed);
         let stream = match format {
             SampleFormat::F32 => device
                 .build_input_stream(
-                    config.clone(),
+                    stream_config.clone(),
                     move |data: &[f32], _| state.push_f32(data),
                     |err| tracing::warn!("microphone callback error: {err}"),
                     None,
@@ -116,7 +141,7 @@ impl Recorder {
                 .context("could not build the input stream")?,
             SampleFormat::I16 => device
                 .build_input_stream(
-                    config.clone(),
+                    stream_config.clone(),
                     move |data: &[i16], _| state.push_i16(data),
                     |err| tracing::warn!("microphone callback error: {err}"),
                     None,
@@ -222,12 +247,22 @@ fn select_config(device: &Device) -> Result<(StreamConfig, SampleFormat)> {
     let mut chosen: Option<cpal::SupportedStreamConfig> = None;
     for range in device.supported_input_configs()? {
         if range.min_sample_rate() <= SAMPLE_RATE && range.max_sample_rate() >= SAMPLE_RATE {
-            if range.sample_format() == SampleFormat::F32 {
+            let mono = range.channels() == 1;
+            let format = range.sample_format();
+            let better = match &chosen {
+                None => true,
+                Some(current) => {
+                    (mono && current.channels() != 1)
+                        || (mono == (current.channels() == 1)
+                            && format == SampleFormat::F32
+                            && current.sample_format() != SampleFormat::F32)
+                }
+            };
+            if better {
                 chosen = Some(range.with_sample_rate(SAMPLE_RATE));
-                break;
             }
-            if range.sample_format() == SampleFormat::I16 && chosen.is_none() {
-                chosen = Some(range.with_sample_rate(SAMPLE_RATE));
+            if mono && format == SampleFormat::F32 {
+                break;
             }
         }
     }
@@ -238,13 +273,26 @@ fn select_config(device: &Device) -> Result<(StreamConfig, SampleFormat)> {
             .context("could not read the microphone configuration")?,
     };
     let format = config.sample_format();
-    tracing::info!("microphone format {format:?} at {} Hz", config.sample_rate());
+    tracing::info!(
+        "microphone format {format:?} at {} Hz, {} channel(s)",
+        config.sample_rate(),
+        config.channels()
+    );
     Ok((config.into(), format))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resample;
+    use super::{resample, Recorder};
+
+    #[test]
+    fn downmixes_interleaved_stereo() {
+        let recorder = Recorder::new(1);
+        recorder.state.channels.store(2, std::sync::atomic::Ordering::Relaxed);
+        let interleaved = [1.0f32, -1.0, 0.5, 0.5, 0.0, 0.8];
+        let mono = recorder.state.mono_f32(&interleaved);
+        assert_eq!(mono, vec![0.0, 0.5, 0.4]);
+    }
 
     #[test]
     fn resamples_48k_to_16k() {
