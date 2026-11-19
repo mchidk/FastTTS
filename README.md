@@ -34,7 +34,7 @@ are spellings of rare names.
 
 - **Streaming.** While you are still talking, every finished sentence is
   already being transcribed. Letting go of Caps Lock only waits for the last
-  one, typically well under half a second.
+  one, typically about half a second.
 - **Whole sentences.** Phrases are cut at natural pauses, so the model hears
   full sentences, which is where it is most accurate.
 - **No lost first word.** The microphone stays open and keeps the last
@@ -61,7 +61,7 @@ start FastTTS when you sign in, or run `.\install.ps1 -Uninstall` to remove it.
 The first build downloads the speech model (about 660 MB) and ONNX Runtime
 from pinned addresses and checks each file's SHA-256. They are kept in
 `models\` and `runtime\` and copied beside the installed exe. FastTTS uses
-about 1 GB of memory while it runs.
+about 700 MB of memory while it runs.
 
 ## Use
 
