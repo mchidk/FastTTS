@@ -3,6 +3,8 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+#[cfg(test)]
+mod bench;
 mod cleanup;
 mod config;
 mod hook;

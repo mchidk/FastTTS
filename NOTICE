@@ -2,26 +2,25 @@ FastTTS
 Copyright (c) 2026 Michael Christensen
 Licensed under the MIT License (see LICENSE).
 
-FastTTS is an independent project and is not affiliated with Cactus Compute.
-
 Third-party components
 ======================
 
-Cactus Whistle speech model (models/whistle.cact, embedded in fasttts.exe)
-  Apache-2.0
-  https://huggingface.co/Cactus-Compute/whistle
-  SHA-256 b6e02f048568ac5d01a2042556c658061e699acbc0aa2a1439f52f3d461dffeb
+Parakeet TDT 0.6B v2 speech model (models/parakeet-tdt-0.6b-v2)
+  Copyright NVIDIA Corporation. Licensed under CC-BY-4.0.
+  https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
+  ONNX export by Ilya Stupakov:
+  https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx
+  (revision 0bbb45a3365852604aef28b538a8f066f4ccaa85)
 
-Cactus Needle engine and the cactus-rs / cactus-sys bindings
-  Apache-2.0 (engine), MIT OR Apache-2.0 (bindings)
-  https://github.com/cactus-compute/cactus
-  https://github.com/hxphsts/cactus-rs
+ONNX Runtime 1.32 (runtime/onnxruntime.dll)
+  Copyright Microsoft Corporation. MIT License.
+  https://onnxruntime.ai
 
-LLVM libc++ and libunwind (statically linked)
-  Apache-2.0 WITH LLVM-exception
-  https://llvm.org
+Microsoft Visual C++ runtime (runtime/msvcp140*.dll, vcruntime140*.dll)
+  Microsoft-signed redistributable files, distributed under the Microsoft
+  Visual C++ Redistributable license terms.
 
-Rust crates (cpal, clipboard-win, windows, regex, serde, toml, tracing, anyhow)
+Rust crates (ort, cpal, windows, regex, serde, toml, tracing, anyhow)
   MIT or Apache-2.0
 
 tests/fixtures/speech.wav was synthesised with the Windows speech engine.

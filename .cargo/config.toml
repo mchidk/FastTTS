@@ -1,11 +1,2 @@
 [build]
 target = "x86_64-pc-windows-gnullvm"
-
-[target.x86_64-pc-windows-gnullvm]
-# Link LLVM libc++ statically so fasttts.exe needs no DLLs next to it.
-# (libunwind is already static via Rust std.)
-rustflags = ["-C", "link-arg=-l:libc++.a"]
-
-[env]
-# Stop cactus-sys from linking libc++ dynamically; the flag above supplies it.
-CACTUS_CXXSTDLIB = ""

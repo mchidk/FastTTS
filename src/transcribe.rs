@@ -1,30 +1,106 @@
-//! English speech-to-text with Cactus Whistle, embedded in the executable.
+//! English speech-to-text with NVIDIA Parakeet TDT 0.6B v2 on ONNX Runtime.
+//!
+//! Three ONNX models: `nemo128` turns audio into log-mel features, the
+//! FastConformer encoder turns those into frames, and the TDT decoder walks
+//! the frames, emitting a token and how many frames to skip at each step.
 
-use anyhow::{Context, Result};
-use cactus_rs::whistle::{Language, TranscribeOptions, Weights, Whistle};
+use anyhow::{anyhow, Context, Result};
+use ort::{
+    environment::Environment,
+    session::Session,
+    value::{Tensor, TensorRef},
+};
+use std::{
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+use windows::{core::PCWSTR, Win32::System::LibraryLoader::SetDllDirectoryW};
 
-/// The 16.9 MB Whistle model (Apache-2.0), see NOTICE.
-static MODEL: &[u8] = include_bytes!("../models/whistle.cact");
-
+const MODEL_DIR: &str = "models/parakeet-tdt-0.6b-v2";
+const RUNTIME_DIR: &str = "runtime";
+/// Silence around each chunk: the decoder commits a word only once it has
+/// heard a little of what follows.
+const PAD_SAMPLES: usize = 8_000;
 /// Quiet takes are raised to this peak before transcription.
 const TARGET_PEAK: f32 = 0.5;
 /// Never amplify more than this (+20 dB), so room noise stays noise.
 const MAX_GAIN: f32 = 10.0;
+/// TDT emits at most this many tokens before moving to the next frame.
+const MAX_TOKENS_PER_FRAME: usize = 10;
+/// Decoder LSTM state: 2 layers of 640.
+const STATE_SHAPE: [usize; 3] = [2, 1, 640];
+
+/// Folder holding `models/` and `runtime/`: next to the exe when installed,
+/// or the repository root when run from `target/`.
+pub fn assets_root() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| dir.join(MODEL_DIR).join("vocab.txt").is_file())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("the speech model ({MODEL_DIR}) is missing next to fasttts.exe"))
+}
+
+/// ONNX Runtime allows one environment per process.
+fn environment(runtime: &Path) -> Result<&'static Environment> {
+    static ENV: OnceLock<Environment> = OnceLock::new();
+    if let Some(env) = ENV.get() {
+        return Ok(env);
+    }
+    // Let onnxruntime.dll find the Visual C++ runtime that sits next to it.
+    let wide: Vec<u16> = runtime.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe { SetDllDirectoryW(PCWSTR(wide.as_ptr()))? };
+    let env = ort::init_from(runtime.join("onnxruntime.dll"))
+        .map_err(|err| anyhow!("could not load ONNX Runtime: {err}"))?
+        .with_name("fasttts")
+        .build()
+        .map_err(|err| anyhow!("could not start ONNX Runtime: {err}"))?;
+    Ok(ENV.get_or_init(|| env))
+}
 
 pub struct Transcriber {
-    whistle: Whistle,
-    options: TranscribeOptions,
+    features: Session,
+    encoder: Session,
+    decoder: Session,
+    vocab: Vec<String>,
+    blank: usize,
 }
 
 impl Transcriber {
     pub fn load() -> Result<Self> {
-        let weights = Weights::from_bytes(MODEL).context("the embedded model is damaged")?;
-        let whistle = Whistle::builder(weights)
-            .build()
-            .context("could not start the Whistle engine")?;
+        let root = assets_root()?;
+        let env = environment(&root.join(RUNTIME_DIR))?;
+        let dir = root.join(MODEL_DIR);
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get() / 2)
+            .clamp(1, 8);
+        let session = |file: &str| -> Result<Session> {
+            let mut builder = Session::builder(env)
+                .and_then(|builder| Ok(builder.with_intra_threads(threads)?))
+                .map_err(|err| anyhow!("could not configure ONNX Runtime: {err}"))?;
+            builder
+                .commit_from_file(dir.join(file))
+                .map_err(|err| anyhow!("could not load {file}: {err}"))
+        };
+        let mut vocab = Vec::new();
+        let text =
+            std::fs::read_to_string(dir.join("vocab.txt")).context("could not read vocab.txt")?;
+        for line in text.lines() {
+            let (piece, index) = line.rsplit_once(' ').context("vocab.txt is damaged")?;
+            let index: usize = index.parse().context("vocab.txt is damaged")?;
+            if vocab.len() <= index {
+                vocab.resize(index + 1, String::new());
+            }
+            vocab[index] = piece.replace('\u{2581}', " ");
+        }
+        let blank = vocab.len().checked_sub(1).context("vocab.txt is empty")?;
         Ok(Self {
-            whistle,
-            options: TranscribeOptions::new().with_language(Language::En),
+            features: session("nemo128.onnx")?,
+            encoder: session("encoder-model.int8.onnx")?,
+            decoder: session("decoder_joint-model.int8.onnx")?,
+            vocab,
+            blank,
         })
     }
 
@@ -35,15 +111,86 @@ impl Transcriber {
             return Ok(String::new());
         }
         let audio = normalize(samples);
-        let transcript = self
-            .whistle
-            .transcribe_with_options(&audio, &self.options)
-            .context("transcription failed")?;
-        Ok(transcript.text().trim().to_string())
+        self.decode(&audio)
+            .map_err(|err| anyhow!("transcription failed: {err}"))
+    }
+
+    fn decode(&mut self, audio: &[f32]) -> ort::Result<String> {
+        let features = self.features.run(ort::inputs![
+            "waveforms" => TensorRef::from_array_view(([1usize, audio.len()], audio))?,
+            "waveforms_lens" => Tensor::from_array(([1usize], vec![audio.len() as i64]))?,
+        ])?;
+        let encoded = self.encoder.run(ort::inputs![
+            "audio_signal" => features["features"].view(),
+            "length" => features["features_lens"].view(),
+        ])?;
+        let (shape, data) = encoded["outputs"].try_extract_tensor::<f32>()?;
+        let (width, frames) = (shape[1] as usize, shape[2] as usize);
+        let (_, lengths) = encoded["encoded_lengths"].try_extract_tensor::<i64>()?;
+        let length = (lengths[0].max(0) as usize).min(frames);
+        // Frame-major copy, so each decoder step reads one contiguous frame.
+        let mut columns = vec![0f32; frames * width];
+        for (channel, row) in data.chunks_exact(frames).enumerate() {
+            for (frame, &value) in row.iter().enumerate() {
+                columns[frame * width + channel] = value;
+            }
+        }
+
+        let state_len: usize = STATE_SHAPE.iter().product();
+        let mut states = (vec![0f32; state_len], vec![0f32; state_len]);
+        let mut previous = self.blank as i32;
+        let mut tokens = Vec::new();
+        let (mut frame, mut emitted) = (0, 0);
+        while frame < length {
+            let column = &columns[frame * width..(frame + 1) * width];
+            let step = self.decoder.run(ort::inputs![
+                "encoder_outputs" => TensorRef::from_array_view(([1usize, width, 1], column))?,
+                "targets" => Tensor::from_array(([1usize, 1], vec![previous]))?,
+                "target_length" => Tensor::from_array(([1usize], vec![1i32]))?,
+                "input_states_1" => TensorRef::from_array_view((STATE_SHAPE, states.0.as_slice()))?,
+                "input_states_2" => TensorRef::from_array_view((STATE_SHAPE, states.1.as_slice()))?,
+            ])?;
+            let (_, logits) = step["outputs"].try_extract_tensor::<f32>()?;
+            let (token_logits, skip_logits) = logits.split_at(self.blank + 1);
+            let token = argmax(token_logits);
+            let skip = argmax(skip_logits);
+            if token != self.blank {
+                states.0 = step["output_states_1"]
+                    .try_extract_tensor::<f32>()?
+                    .1
+                    .to_vec();
+                states.1 = step["output_states_2"]
+                    .try_extract_tensor::<f32>()?
+                    .1
+                    .to_vec();
+                previous = token as i32;
+                tokens.push(token);
+                emitted += 1;
+            }
+            if skip > 0 {
+                frame += skip;
+                emitted = 0;
+            } else if token == self.blank || emitted == MAX_TOKENS_PER_FRAME {
+                frame += 1;
+                emitted = 0;
+            }
+        }
+        let text: String = tokens.iter().map(|&t| self.vocab[t].as_str()).collect();
+        Ok(text.trim().to_string())
     }
 }
 
-/// Bring quiet speech up to a consistent level.
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0;
+    for (index, value) in values.iter().enumerate() {
+        if *value > values[best] {
+            best = index;
+        }
+    }
+    best
+}
+
+/// Bring quiet speech up to a consistent level, framed by silence.
 fn normalize(samples: &[f32]) -> Vec<f32> {
     let peak = samples.iter().fold(0f32, |m, x| m.max(x.abs()));
     let gain = if peak > 0.0 {
@@ -51,7 +198,10 @@ fn normalize(samples: &[f32]) -> Vec<f32> {
     } else {
         1.0
     };
-    samples.iter().map(|x| x * gain).collect()
+    let mut audio = vec![0.0; PAD_SAMPLES];
+    audio.extend(samples.iter().map(|x| x * gain));
+    audio.extend(std::iter::repeat_n(0.0, PAD_SAMPLES));
+    audio
 }
 
 #[cfg(test)]
@@ -107,7 +257,7 @@ pub(crate) mod tests {
         Friday. I will review the numbers on Monday morning, and then we can schedule a meeting \
         with the whole department to discuss the budget for next year.";
 
-    /// One test owns the model: Whistle allows a single engine per process.
+    /// One test owns the model: it is large, so load it once.
     #[test]
     fn transcribes_whole_streamed_and_soft_speech() {
         let mut model = Transcriber::load().expect("model");

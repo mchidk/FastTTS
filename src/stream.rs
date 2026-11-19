@@ -33,6 +33,9 @@ const MIN_PHRASE: usize = RATE;
 
 pub struct Chunk {
     pub audio: Vec<f32>,
+    /// Position of the first sample within the take (used by the bench).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub start: usize,
     /// True when the cut was forced mid-speech, so the next chunk continues
     /// the same sentence.
     pub continues: bool,
@@ -44,6 +47,8 @@ pub struct Chunker {
     pub loudest: f32,
     pub voiced_total: usize,
     max_len: usize,
+    /// Position within the take of `buf[0]`.
+    origin: usize,
     pause_frames: usize,
     buf: Vec<f32>,
     frames: Vec<f32>,
@@ -76,6 +81,7 @@ impl Chunker {
             max_len: ((chunk_seconds * RATE as f32) as usize).max(MIN_PHRASE + FRAME),
             pause_frames: (pause_ms as usize).div_ceil(20).max(1),
             buf: Vec::new(),
+            origin: 0,
             frames: Vec::new(),
             voiced: 0,
             quiet: 0,
@@ -98,11 +104,14 @@ impl Chunker {
 
     /// Flush whatever is left when Caps Lock is released.
     pub fn finish(&mut self) -> Option<Chunk> {
+        let start = self.origin;
         let audio = std::mem::take(&mut self.buf);
         let speech = self.voiced >= MIN_VOICED_FRAMES || has_speech(&audio, self.threshold);
+        self.origin += audio.len();
         self.reset();
         speech.then_some(Chunk {
             audio,
+            start,
             continues: false,
         })
     }
@@ -132,18 +141,22 @@ impl Chunker {
                 let drop = (self.buf.len() - LEAD_IN) / FRAME * FRAME;
                 self.buf.drain(..drop);
                 self.frames.drain(..drop / FRAME);
+                self.origin += drop;
             }
             return;
         }
 
         if self.quiet >= self.pause_frames && self.buf.len() >= MIN_PHRASE {
             // A pause ended the phrase.
+            let start = self.origin;
             let audio = std::mem::take(&mut self.buf);
             let speech = self.voiced >= MIN_VOICED_FRAMES;
+            self.origin += audio.len();
             self.reset();
             if speech {
                 out.push(Chunk {
                     audio,
+                    start,
                     continues: false,
                 });
             }
@@ -151,6 +164,8 @@ impl Chunker {
             let cut = self.quietest_cut();
             let rest = self.buf.split_off(cut);
             let audio = std::mem::replace(&mut self.buf, rest);
+            let start = self.origin;
+            self.origin += cut;
             self.frames.drain(..cut / FRAME);
             let threshold = self.threshold;
             self.voiced = self.frames.iter().filter(|&&f| f > threshold).count();
@@ -163,6 +178,7 @@ impl Chunker {
             // Only a cut with speech right after it splits a sentence.
             out.push(Chunk {
                 audio,
+                start,
                 continues: self.voiced > 0,
             });
         }

@@ -7,23 +7,39 @@ tray, listens while you hold Caps Lock, turns your speech into text on your
 own PC, and types it wherever your cursor is.
 
 Everything runs locally. There is no window to manage, no account and no
-cloud. The whole app is a single `fasttts.exe` with the speech model inside.
+cloud. The app is one folder: `fasttts.exe`, the speech model and ONNX
+Runtime. Nothing is installed system-wide and nothing is downloaded at run
+time.
 
 ![FastTTS while listening](docs/assets/hud-listening.png)
 ![FastTTS while transcribing](docs/assets/hud-transcribing.png)
 ![FastTTS when nothing was heard](docs/assets/hud-error.png)
 
+## Accurate
+
+FastTTS uses NVIDIA's [Parakeet TDT 0.6B v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2),
+one of the most accurate open English speech models, on the CPU. Word error
+rate on 365 recordings of real speakers from LibriSpeech (73 speakers,
+47 minutes), measured through FastTTS's own streaming:
+
+| Speech model | clean speech | harder speakers | speed |
+|---|---|---|---|
+| Cactus Whistle (FastTTS 1.0) | 5.5% | 12.7% | 15x real time |
+| **Parakeet TDT 0.6B v2** | **1.6%** | **3.2%** | 21x real time |
+
+About one wrong word in 60, against one in 18 before. Most remaining errors
+are spellings of rare names.
+
 ## Why it feels instant
 
-- **Streaming.** While you are still talking, every finished phrase is
+- **Streaming.** While you are still talking, every finished sentence is
   already being transcribed. Letting go of Caps Lock only waits for the last
-  few seconds, typically well under half a second.
-- **Small, fast model.** [Cactus Whistle](https://huggingface.co/Cactus-Compute/whistle)
-  is a 16.9 MB English speech model that runs on the CPU at roughly 16 times
-  real time.
+  one, typically well under half a second.
+- **Whole sentences.** Phrases are cut at natural pauses, so the model hears
+  full sentences, which is where it is most accurate.
 - **No lost first word.** The microphone stays open and keeps the last
   250 ms, so a take starts slightly before you press the key.
-- **Native.** One Rust executable, no runtime to start, no DLLs beside it.
+- **Native.** A Rust executable; the model loads once and stays ready.
 
 ## Install
 
@@ -42,7 +58,10 @@ rustup target add x86_64-pc-windows-gnullvm
 adds Desktop and Start menu shortcuts and starts the app. Add `-Startup` to
 start FastTTS when you sign in, or run `.\install.ps1 -Uninstall` to remove it.
 
-The first build downloads the Cactus engine library and checks its SHA-256.
+The first build downloads the speech model (about 660 MB) and ONNX Runtime
+from pinned addresses and checks each file's SHA-256. They are kept in
+`models\` and `runtime\` and copied beside the installed exe. FastTTS uses
+about 1 GB of memory while it runs.
 
 ## Use
 
@@ -65,8 +84,8 @@ optional; these are the defaults:
 
 ```toml
 cleanup = true             # remove fillers and stutters, fix capitals
-chunk_seconds = 6.0        # longest piece of continuous speech per model call
-silence_ms = 500           # a pause this long ends a phrase
+chunk_seconds = 12.0       # longest piece of continuous speech per model call
+silence_ms = 700           # a pause this long ends a sentence
 min_hold_ms = 250          # shorter Caps Lock taps are ignored
 max_record_seconds = 300   # a take stops by itself after this long
 hud = true                 # the oscilloscope above the taskbar
@@ -97,9 +116,9 @@ Restart FastTTS after changing the file.
 ## How it works
 
 ```
-Caps Lock hook -> microphone -> 16 kHz mono -> phrase chunker -> Whistle model
-                                                                     |
-               paste at cursor <- cleanup <- join phrases <----------+
+Caps Lock hook -> microphone -> 16 kHz mono -> sentence chunker -> Parakeet
+                                                                      |
+               paste at cursor <- cleanup <- join sentences <---------+
 ```
 
 The keyboard hook, the HUD, the model and text insertion each run on their
@@ -113,8 +132,15 @@ cargo test --release
 ```
 
 The tests cover the resampler, chunker, cleanup, settings and HUD drawing,
-and run the real model on a recorded sentence in `tests/fixtures`, both whole
-and streamed. To redraw the images in this README from the HUD code:
+and run the real model on a recorded sentence in `tests/fixtures`, whole,
+streamed, soft and as a one-minute dictation.
+
+To measure accuracy on your own recordings, put 16 kHz mono WAV files and a
+`refs.json` (`[{"file": "a.wav", "text": "..."}]`) in a folder and run
+`FASTTTS_BENCH=<folder> cargo test --release bench -- --ignored`; it writes
+each transcript to `hyp-fasttts.json`.
+
+To redraw the images in this README from the HUD code:
 
 ```powershell
 cargo test --release readme_images -- --ignored
@@ -122,5 +148,5 @@ cargo test --release readme_images -- --ignored
 
 ## License
 
-FastTTS is MIT licensed. Cactus Whistle and its engine are Apache-2.0; see
-[NOTICE](NOTICE).
+FastTTS is MIT licensed. The Parakeet model is CC-BY-4.0 (NVIDIA) and ONNX
+Runtime is MIT (Microsoft); see [NOTICE](NOTICE).

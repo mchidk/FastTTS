@@ -31,8 +31,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             cleanup: true,
-            chunk_seconds: 6.0,
-            silence_ms: 500,
+            chunk_seconds: 12.0,
+            silence_ms: 700,
             min_hold_ms: 250,
             max_record_seconds: 300,
             hud: true,

@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.0 - 2026-11-19
+
+### Changed
+
+- Speech model: NVIDIA Parakeet TDT 0.6B v2 on ONNX Runtime replaces Cactus
+  Whistle. On 365 LibriSpeech recordings from 73 real speakers the word
+  error rate falls from 5.5% to 1.6% on clean speech and from 12.7% to 3.2%
+  on harder speakers, and transcription is faster (21x real time).
+- Streaming cuts at sentence pauses (`silence_ms = 700`, at most
+  `chunk_seconds = 12`), because the model is most accurate on whole
+  sentences; letting go still waits well under a second.
+- The app is a folder: `fasttts.exe`, `models\` and `runtime\` (ONNX
+  Runtime and the Visual C++ runtime). The first build downloads them from
+  pinned addresses and verifies each SHA-256; `install.ps1` copies them.
+
+### Tried and left out
+
+- Proofreading with a small local LLM (Qwen2.5 1.5B): it changed none of
+  the 365 transcripts and added 2 s per sentence. The remaining errors are
+  mostly spellings of rare names, which text alone cannot correct.
+- Parakeet TDT 0.6B v3 (adds Danish): 2.0% and 4.8% on the same English
+  test, so v2 stays the default for English.
+
 ## 1.0.3 - 2026-11-18
 
 ### Fixed

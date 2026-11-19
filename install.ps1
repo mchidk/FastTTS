@@ -3,7 +3,8 @@
   Install FastTTS for the current user, or remove it.
 
 .DESCRIPTION
-  Copies the self-contained fasttts.exe to %LOCALAPPDATA%\Programs\FastTTS,
+  Copies fasttts.exe with its speech model and ONNX Runtime (runtime\ and
+  models\) to %LOCALAPPDATA%\Programs\FastTTS,
   adds Desktop and Start menu shortcuts and starts it. It builds the release
   first, so the installed exe always matches the source.
 
@@ -53,6 +54,25 @@ $built = Join-Path $PSScriptRoot 'target\x86_64-pc-windows-gnullvm\release\fastt
 Stop-FastTTS
 New-Item -ItemType Directory -Force $target | Out-Null
 Copy-Item $built $exe -Force
+
+# The speech model and ONNX Runtime live beside the exe. Copy a file only
+# when its verified-hash marker differs, so reinstalling skips the 650 MB.
+foreach ($folder in 'runtime', 'models') {
+  $source = Join-Path $PSScriptRoot $folder
+  Get-ChildItem $source -Recurse -File | Where-Object { $_.Extension -ne '.sha256' } | ForEach-Object {
+    $relative = $_.FullName.Substring($source.Length + 1)
+    $destination = Join-Path (Join-Path $target $folder) $relative
+    $marker = "$($_.FullName).sha256"
+    $installedMarker = "$destination.sha256"
+    $current = (Test-Path $destination) -and (Test-Path $marker) -and (Test-Path $installedMarker) -and
+      ((Get-Content $marker -Raw) -eq (Get-Content $installedMarker -Raw))
+    if (-not $current) {
+      New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+      Copy-Item $_.FullName $destination -Force
+      if (Test-Path $marker) { Copy-Item $marker $installedMarker -Force }
+    }
+  }
+}
 
 $shell = New-Object -ComObject WScript.Shell
 $wanted = if ($Startup) { $links } else { $links[0..1] }
